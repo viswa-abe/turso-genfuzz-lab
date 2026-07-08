@@ -121,6 +121,20 @@ JOIN_STYLES: tuple[str, ...] = ("inner", "left", "cross")
 
 OP_FAMILIES: tuple[str, ...] = ("DDL", "DML", "QUERY", "LIFECYCLE", "EXPECT_ERROR")
 
+# Per-table POPULATION MODES (EXP-106 lever 1) -- a generic data-population axis so tables
+# do NOT all end up populated the same way. Drawn per base table at DDL time. `empty` leaves
+# the table with no rows; `all_null` inserts rows whose columns are ALL NULL; `populated`
+# is the ordinary boundary-value fill. Making some tables empty and some all-NULL is what
+# makes degenerate outer-join groups and all-NULL aggregate inputs appear BY DESIGN (the
+# WP-002 empty/null-group shape) rather than incidentally. Weighted as data, never pinned:
+# populated dominates so the base surface stays realistic, but a meaningful minority are
+# degenerate. Generic across any SQL engine.
+POPULATION_MODES: tuple[tuple[str, int], ...] = (
+    ("populated", 6),
+    ("empty", 2),
+    ("all_null", 2),
+)
+
 
 # ---------------------------------------------------------------------------
 # Feature families (generic op-kind families) and their reference-comparability
@@ -308,6 +322,35 @@ def _pool_value(rng: random.Random) -> Any:
     return BOUNDARY_VALUES[rng.randrange(len(BOUNDARY_VALUES))]
 
 
+# Text-safe subset of the boundary pool: values that render byte-identically across the CLI
+# `-m list` transport (no raw-blob bytes, no float-format ambiguity, no NULL-vs-empty-string
+# collision), so a differential on a value that passed through string concatenation is a real
+# product divergence rather than a transport artifact. Used where a swept value flows through
+# a TEXT path (trigger `||` concat, aux insert) whose stdout rendering must be unambiguous.
+# DERIVED from BOUNDARY_VALUES (single source of truth) -- the plain `str` members that are not
+# the zeroblob sentinel; adding a string edge to BOUNDARY_VALUES automatically widens this sweep.
+_TEXT_BOUNDARY_VALUES: tuple[str, ...] = tuple(
+    v for v in BOUNDARY_VALUES if isinstance(v, str) and not v.startswith("zeroblob:")
+)
+
+
+def _text_boundary(rng: random.Random) -> str:
+    return _TEXT_BOUNDARY_VALUES[rng.randrange(len(_TEXT_BOUNDARY_VALUES))]
+
+
+def _weighted_choice(rng: random.Random, pairs: tuple[tuple[Any, int], ...]) -> Any:
+    """Pick one item from a (value, weight) table. Generic; used by the population-mode and
+    other data-driven weighted axes so weights live in DATA, never as inline magic."""
+    total = sum(w for _, w in pairs)
+    r = rng.randrange(total)
+    acc = 0
+    for val, w in pairs:
+        acc += w
+        if r < acc:
+            return val
+    return pairs[-1][0]
+
+
 def _gen_ddl(rng: random.Random, tables: list[dict]) -> list[Op]:
     """Create a table (varied identifier styles) plus sometimes an index/view."""
     ops: list[Op] = []
@@ -318,7 +361,11 @@ def _gen_ddl(rng: random.Random, tables: list[dict]) -> list[Op]:
     cols = [render_identifier(f"c{j}", IDENTIFIER_STYLES[rng.randrange(len(IDENTIFIER_STYLES))]) for j in range(ncols)]
     coldefs = ", ".join(f"{c} {tp}" for c, tp in zip(cols, _col_types(rng, ncols)))
     ops.append(Op("DDL", "create_table", f"CREATE TABLE {tname}({coldefs});"))
-    tables.append({"name": tname, "cols": cols})
+    # Assign a generic population mode (EXP-106 lever 1). _gen_dml reads it so an `empty`
+    # table gets no rows and an `all_null` table gets all-NULL rows -- degenerate shapes
+    # that make empty/all-null aggregate-over-join groups appear by design, not by luck.
+    pop_mode = _weighted_choice(rng, POPULATION_MODES)
+    tables.append({"name": tname, "cols": cols, "pop": pop_mode})
     # Optional secondary DDL over the just-created table.
     roll = rng.random()
     if roll < 0.4:
@@ -347,10 +394,26 @@ def _gen_dml(rng: random.Random, tables: list[dict]) -> list[Op]:
     ops: list[Op] = []
     tbl = tables[rng.randrange(len(tables))]
     ncols = len(tbl["cols"])
+    pop = tbl.get("pop", "populated")
+    if pop == "empty":
+        # Deliberately leave this table empty -- no rows inserted. An outer join against it
+        # yields the degenerate empty-group shape (WP-002). Emit a real, aligned no-op that
+        # both engines accept identically and that inserts nothing: a WHERE-guarded DELETE on
+        # the still-empty table (deletes zero rows, zero result rows). A bare SQL comment is
+        # NOT used -- the CLI's one-statement-per-process transport parses a comment-only op
+        # inconsistently, drifting statement alignment; a real DELETE keeps ref/cand aligned.
+        ops.append(Op("DML", "insert_skipped_empty",
+                      f"DELETE FROM {tbl['name']} WHERE 1=0;"))
+        return ops
     nrows = rng.randint(1, 4)
     tuples = []
     for _ in range(nrows):
-        tuples.append("(" + ", ".join(render_literal(_pool_value(rng)) for _ in range(ncols)) + ")")
+        if pop == "all_null":
+            # All-NULL row: every column NULL, so aggregates over this column see an all-null
+            # input (min/max/avg -> NULL, count(col) -> 0) -- the all-null degenerate group.
+            tuples.append("(" + ", ".join("NULL" for _ in range(ncols)) + ")")
+        else:
+            tuples.append("(" + ", ".join(render_literal(_pool_value(rng)) for _ in range(ncols)) + ")")
     ops.append(Op("DML", "insert", f"INSERT INTO {tbl['name']} VALUES {', '.join(tuples)};"))
     roll = rng.random()
     if roll < 0.3:
@@ -581,10 +644,26 @@ def _gen_trigger(rng: random.Random) -> list[Op]:
                   f"INSERT INTO {audit} VALUES('fired:' || NEW.a || ':' || NEW.b); END;"))
     # Reopen so the trigger is exercised after a schema reload (the WP-005 precondition).
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
-    ops.append(Op("DML", "trigger_fire",
-                 f"INSERT INTO {tgt}(id, a, b) VALUES (1, 'ra', 'rb');"))
+    # EXP-106 lever 2 -- SWEEP the fired values from the boundary pool, and fire the trigger
+    # MORE THAN ONCE, so the trigger side-effect (concatenation of boundary values through
+    # NEW.a/NEW.b) is exercised over the whole input space rather than one constant tuple.
+    # WP-005 is a trigger-behavior-after-reload divergence: it only surfaces if the values the
+    # trigger body transforms actually vary. Text-only boundary values are used for a/b (they
+    # feed || string concatenation, where a raw blob would render differently per transport --
+    # a transport artifact, not a product divergence); the whole boundary pool would reintroduce
+    # the render-noise EXP-105 closed. Generic: a swept pool of literals, no target tuple.
+    n_fires = rng.randint(1, 3)
+    for f in range(n_fires):
+        a_val = render_literal(_text_boundary(rng))
+        b_val = render_literal(_text_boundary(rng))
+        ops.append(Op("DML", "trigger_fire",
+                     f"INSERT INTO {tgt}(id, a, b) VALUES ({f + 1}, {a_val}, {b_val});"))
+    # Read back BOTH the fired audit rows (the trigger side-effect, projecting the transformed
+    # values) AND the target-table rows (persisted-value read-back of the swept inputs).
     ops.append(Op("QUERY", "trigger_audit_read",
-                 f"SELECT msg FROM {audit} ORDER BY rowid;"))
+                 f"SELECT msg FROM {audit} ORDER BY msg;"))
+    ops.append(Op("QUERY", "trigger_target_read",
+                 f"SELECT id, a, b FROM {tgt} ORDER BY id;"))
     return ops
 
 
@@ -599,23 +678,34 @@ def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
     # generated program stays runner-independent (data), and the two engines each attach
     # THEIR OWN aux file -- the differential is on behavior, not on the shared path.
     ops.append(Op("LIFECYCLE", "attach", f"ATTACH '@@AUX_DB:{alias}@@' AS {alias};"))
-    at = _fresh_name(rng, "at")
+    # EXP-106 lever 4 -- ATTACH LIFECYCLE COMPLETENESS. Create TWO aux tables so the full
+    # page-lifecycle sequence (aux-DDL + DROP + checkpoint + reopen + read-back) ALWAYS runs
+    # in one program: one table is DROPped (exercising the attached-db page free/reclaim path,
+    # the WP-008 precondition) while the SURVIVOR is read back after the reopen (so there is
+    # always a post-reopen read-back, which the old coin-flip suppressed whenever it dropped
+    # the only table). Aux inserts sweep text-boundary values instead of the constant (1,'x')
+    # so persisted aux values vary. Generic: standard SQL, no target constant.
+    at_drop = _fresh_name(rng, "at")
+    at_keep = _fresh_name(rng, "at")
     ops.append(Op("DDL", "attach_create",
-                  f"CREATE TABLE {alias}.{at}(id INTEGER PRIMARY KEY, v TEXT);"))
+                  f"CREATE TABLE {alias}.{at_drop}(id INTEGER PRIMARY KEY, v TEXT);"))
+    ops.append(Op("DDL", "attach_create2",
+                  f"CREATE TABLE {alias}.{at_keep}(id INTEGER PRIMARY KEY, v TEXT);"))
+    dv = render_literal(_text_boundary(rng))
+    kv = render_literal(_text_boundary(rng))
     ops.append(Op("DML", "attach_insert",
-                  f"INSERT INTO {alias}.{at}(id, v) VALUES (1, 'x'), (2, 'y');"))
-    if rng.random() < 0.5:
-        ops.append(Op("DDL", "attach_drop", f"DROP TABLE {alias}.{at};"))
-        read_ok_after_drop = False
-    else:
-        read_ok_after_drop = True
+                  f"INSERT INTO {alias}.{at_drop}(id, v) VALUES (1, {dv}), (2, {kv});"))
+    ops.append(Op("DML", "attach_insert2",
+                  f"INSERT INTO {alias}.{at_keep}(id, v) VALUES (1, {kv}), (2, {dv});"))
+    # Always DROP one table (the page-lifecycle trigger) and always keep the other to read back.
+    ops.append(Op("DDL", "attach_drop", f"DROP TABLE {alias}.{at_drop};"))
     ops.append(Op("LIFECYCLE", "attach_checkpoint", "PRAGMA wal_checkpoint(TRUNCATE);", ref_comparable=False))
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     # After reopen the ATTACH is gone (reopen is a fresh connection); re-attach to read.
     ops.append(Op("LIFECYCLE", "attach", f"ATTACH '@@AUX_DB:{alias}@@' AS {alias};"))
-    if read_ok_after_drop:
-        ops.append(Op("QUERY", "attach_read",
-                     f"SELECT id, v FROM {alias}.{at} ORDER BY id;"))
+    # Persisted-value read-back of the SURVIVING aux table (projects the swept values).
+    ops.append(Op("QUERY", "attach_read",
+                 f"SELECT id, v FROM {alias}.{at_keep} ORDER BY id;"))
     ops.append(Op("LIFECYCLE", "attach_integrity", "PRAGMA integrity_check;"))
     ops.append(Op("LIFECYCLE", "attach", f"DETACH {alias};"))
     return ops
@@ -719,6 +809,25 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
             elif fam == "attach":
                 ops.extend(_gen_attach(rng, run_ctx))
             present_kinds = {op.kind for op in ops}
+
+    # EXP-106 lever 3 -- GENERIC DURABILITY READ-BACK TAIL. Every program ends with a reopen
+    # followed by a full-column value read-back of every surviving base table. This is the
+    # persisted-value differential the census's WP-015 class needs: written boundary values
+    # must survive a reopen and read back IDENTICALLY on both engines, projecting the actual
+    # columns (not count(*)). It is entirely generic -- no product, no target value -- and
+    # applies to any SQL engine: "anything written and 200-acked must be observable after a
+    # reopen." The reopen forces the values through the on-disk persistence path (the reload
+    # boundary), and projecting ALL columns (ORDER BY every column for a stable multiset) is
+    # what catches a value-level divergence a count(*) would hide. Empty tables read back as
+    # zero rows on both sides (still a valid, cheap differential). Feature-family tables
+    # (fts_*/jdoc*/trg*/aux*/at*) are excluded -- their own generators own their read-backs.
+    ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
+    for tbl in tables:
+        proj = ", ".join(tbl["cols"])
+        ops.append(Op(
+            "QUERY", "durability_readback",
+            f"SELECT {proj} FROM {tbl['name']} ORDER BY {proj};",
+        ))
     # Always end with an integrity check + terminal reopen probe.
     ops.append(Op("LIFECYCLE", "integrity_check", "PRAGMA integrity_check;"))
 
