@@ -1889,10 +1889,41 @@ def oracle_error_class(ref: RunResult, cand: RunResult) -> Finding:
     return Finding("error_class", True, f"aligned={n} skipped_noncomparable={skipped}")
 
 
-def oracle_diff_rows(ref: RunResult, cand: RunResult, cli_text: bool = False) -> Finding:
+_INTEGRITY_SQL_RE = re.compile(r"PRAGMA\s+(integrity_check|quick_check)", re.IGNORECASE)
+
+
+def _all_cells_known_integrity(rowset: list[tuple]) -> Optional[str]:
+    """If EVERY cell of a candidate integrity/quick_check rowset matches a known integrity
+    signature (the confirmed WP-024 FTS message), return the joined rule ids; else None. Used
+    so the diff_rows oracle suppresses the SAME confirmed class the integrity oracle allowlists
+    (an integrity_check's rows also flow through diff_rows), while ANY unknown integrity row
+    -- e.g. an attach/pager corruption message (WP-008) -- still reds."""
+    rules: set[str] = set()
+    saw_any = False
+    for row in rowset:
+        for cell in row:
+            text = str(cell)
+            if text.lower() == "ok":
+                continue
+            saw_any = True
+            sig = match_integrity_signature(text)
+            if sig is None:
+                return None  # an unknown non-ok message -> not fully known, must red
+            rules.add(sig.rule)
+    return ",".join(sorted(rules)) if saw_any else None
+
+
+def oracle_diff_rows(ref: RunResult, cand: RunResult, cli_text: bool = False, emit: bool = False) -> Finding:
     """For each aligned statement that BOTH accepted, the normalized row multisets must
     match. Mismatch = red unless allowlisted. cli_text collapses type tags when either
-    runner is a text-only CLI that cannot carry SQLite's typing."""
+    runner is a text-only CLI that cannot carry SQLite's typing.
+
+    EXP-109: an integrity_check/quick_check statement's ROWS also flow through here, so a
+    candidate integrity row that is entirely the confirmed WP-024 FTS signature would red in
+    diff_rows even though oracle_integrity correctly allowlists it. Consult the SAME
+    KNOWN_INTEGRITY_SIGNATURES allowlist for integrity/quick_check statements: if the reference
+    said `ok` and every candidate non-ok cell is a known signature, SUPPRESS (emit a SUPPRESSED
+    line, continue); any UNKNOWN integrity row (WP-008 attach/pager) still reds normally."""
     n = min(len(ref.stmts), len(cand.stmts))
     for i in range(n):
         r, c = ref.stmts[i], cand.stmts[i]
@@ -1906,6 +1937,16 @@ def oracle_diff_rows(ref: RunResult, cand: RunResult, cli_text: bool = False) ->
             d = match_divergence(c.sql, "")
             if d is not None:
                 return Finding("diff_rows", True, f"suppressed stmt={c.sql!r}", d.id)
+            # Known-integrity-signature allowlist on integrity/quick_check statements: the same
+            # confirmed WP-024 class the integrity oracle already suppressed. Only suppresses
+            # when the reference is a clean `ok` and every candidate non-ok cell is known.
+            if _INTEGRITY_SQL_RE.search(c.sql):
+                ref_ok = all(str(cell).lower() == "ok" for row in r.rows for cell in row)
+                known = _all_cells_known_integrity(c.rows)
+                if ref_ok and known is not None:
+                    emit_suppressed(known, f"diff_rows-on-integrity stmt={c.sql!r} "
+                                           f"cand_rows={[tuple(str(x) for x in row) for row in c.rows][:2]!r}", emit)
+                    continue
             return Finding(
                 "diff_rows", False,
                 f"rowset-mismatch stmt={c.sql!r} ref={rref[:4]!r} cand={rcand[:4]!r} "
@@ -1979,7 +2020,7 @@ def run_case(
         cli_text = getattr(reference, "text_only", False) or getattr(candidate, "text_only", False)
         for oracle in ORACLES:
             if oracle is oracle_diff_rows:
-                f = oracle(ref_result, cand_result, cli_text)
+                f = oracle(ref_result, cand_result, cli_text, emit)
             elif oracle is oracle_integrity:
                 f = oracle(ref_result, cand_result, emit)
             else:
