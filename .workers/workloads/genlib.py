@@ -108,9 +108,15 @@ BOUNDARY_VALUES: tuple[Any, ...] = (
 # through a scalar/aggregate (coalesce(blob), max(blob), a CTE `max(x)`) is transport-ambiguous
 # for the SAME reason as an embedded newline -- two distinct non-UTF8 bytes both print as U+FFFD,
 # an irrecoverable stdout loss, not a product divergence. A clean-UTF8 blob still stores as a
-# BLOB (exercises blob affinity, storage, durability) and reads back byte-faithfully, and the
-# durability read-back additionally wraps every column in quote() (byte-faithful `X'..'` hex)
-# so blob VALUES are still compared exactly where it is safe to do so.
+# BLOB (exercises blob affinity, storage, durability) and reads back byte-faithfully through
+# bare projection (control bytes hex-encode symmetrically on both sides), so blob VALUES are
+# still compared exactly.
+# Known trade-off (reviewer, EXP-106): non-UTF8 BLOB STORAGE coverage is lost from the shared
+# pool. A storage-only reintroduction is NOT sound as-is: a non-UTF8 blob stored by DML leaks
+# to bare projection through `max(col)` / agg-over-join / the CTE `max(x)` over the same
+# tables, and quote()-wrapping those aggregates would strip _RealText provenance and turn
+# tursodb's 17-digit REAL rendering into false reds. Reintroducing it needs a transport-safe
+# aggregate projection design first -- recorded as follow-up, not silently dropped.
 
 # Identifier styles for DDL -- plain, quoted, keyword-ish, unicode. Data-driven so
 # the generator exercises the identifier grammar rather than one safe style.
@@ -832,19 +838,21 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
     # (fts_*/jdoc*/trg*/aux*/at*) are excluded -- their own generators own their read-backs.
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     for tbl in tables:
-        # Project every column through quote() so the read-back is TRANSPORT-SAFE: quote()
-        # renders a BLOB as a byte-faithful X'..' hex literal (identical on both engines),
-        # text as an escaped 'literal', NULL as NULL, and numbers verbatim -- so a raw-blob
-        # column's non-UTF8 bytes survive the `-m list` text transport instead of being lossily
-        # replaced by U+FFFD (which would masquerade as a divergence). Generic and value-
-        # preserving: quote() is standard SQL both engines share, and it never collapses two
-        # distinct stored values to the same text. ORDER BY the quoted projection for a stable
-        # multiset. (Signed-zero REAL rendering is handled downstream in _cells_equal.)
-        proj = ", ".join(f"quote({c})" for c in tbl["cols"])
-        order = ", ".join(f"quote({c})" for c in tbl["cols"])
+        # BARE column projection, deliberately NOT quote()-wrapped. Bare projection flows
+        # through the normalization machinery with full type provenance: the reference cell
+        # arrives as a typed Python value, so REALs get `_RealText`-tagged and print-format
+        # splits (17-vs-15-digit, signed zero) reconcile in _cells_equal. quote() was tried
+        # here (EXP-106 guest smoke) and REVERTED: engines render quote(REAL) with different
+        # digit counts (sqlite3 '9.223372036854775808e+18' vs tursodb '9.22337203685477581e+18'
+        # for the SAME double), and quoted output is plain text with NO provenance -- a false
+        # red the reconciler is forbidden to absorb. Bare projection is transport-sound
+        # because the boundary pool contains no value whose bare stdout rendering is lossy
+        # (see the blob NOTE above BOUNDARY_VALUES); ORDER BY the same columns for a stable
+        # multiset.
+        proj = ", ".join(tbl["cols"])
         ops.append(Op(
             "QUERY", "durability_readback",
-            f"SELECT {proj} FROM {tbl['name']} ORDER BY {order};",
+            f"SELECT {proj} FROM {tbl['name']} ORDER BY {proj};",
         ))
     # Always end with an integrity check + terminal reopen probe.
     ops.append(Op("LIFECYCLE", "integrity_check", "PRAGMA integrity_check;"))
@@ -944,8 +952,10 @@ def _cells_equal(a: str, b: str) -> bool:
     # Signed-zero: IEEE -0.0 == 0.0, but engines differ on the sign GLYPH (sqlite3 keeps the
     # sign -> '-0.0'; tursodb `-m list` drops it -> '0.0'). Both agree the VALUE is zero, so
     # collapse the sign on zero. This cannot mask a real divergence: any nonzero double keeps
-    # its sign, so only the zero-vs-zero sign-render noise is absorbed (EXP-106: durability
-    # read-back of a stored -0.0 REAL surfaced this transport render split).
+    # its sign, so only the zero-vs-zero sign-render noise is absorbed. Live trigger sites
+    # (EXP-106): any BARE REAL projection of a stored -0.0 -- the durability read-back tail,
+    # `max(col)` in agg_ungrouped/agg_over_join, the CTE `max(x)` subquery, scalar round() --
+    # where the reference cell IS a Python float and gets `_RealText`-tagged.
     if fa == 0.0:
         fa = 0.0
     if fb == 0.0:
