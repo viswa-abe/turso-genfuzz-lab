@@ -745,6 +745,7 @@ class RunResult:
     crash_text: str = ""
     reopened_ok: bool = True      # db reopenable after run
     integrity_ok: Optional[bool] = None  # last integrity_check verdict, if run
+    page_size_readback: str = ""  # PRAGMA page_size read back post-run (config-realized proof)
 
 
 class Runner:
@@ -762,6 +763,45 @@ class Runner:
 
 # ---- Normalization (shared, so both runners are compared apples-to-apples) ----
 
+_REAL_TEXT_RE = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?")
+
+
+def _as_real_text(cell: str) -> Optional[float]:
+    """If a normalized cell is a REAL *rendering* (has a '.' or exponent and parses as a
+    finite float), return that float; else None. Requiring a '.'/exponent means a bare
+    integer ('42') and non-float text ('12abc', or hex like '302E30' from hex(0.0)) are NOT
+    treated as reals -- so pairwise float reconciliation only fires when BOTH sides really
+    are REAL renderings of the same value at different precisions."""
+    t = cell.strip()
+    if not _REAL_TEXT_RE.fullmatch(t):
+        return None
+    if "." not in t and "e" not in t and "E" not in t:
+        return None  # bare integer -- compare exactly, don't float-reconcile
+    try:
+        f = float(t)
+    except (ValueError, OverflowError):
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _cells_equal(a: str, b: str) -> bool:
+    """Two normalized cells are equal if they are byte-identical OR both are REAL renderings
+    that agree to 15 significant digits (SQLite's own `%!.15g` float-print precision). The
+    15-sig-digit reconciliation is what makes tursodb's shortest-roundtrip REAL (17 digits,
+    '1.0e+308') compare equal to the reference's differently-rendered SAME double -- purely a
+    print-format difference, not a value difference (a genuinely different double diverges
+    within 15 sig-digits and still reds). Applied pairwise so a hex/text cell that merely
+    looks float-ish (e.g. '302E30') is never coerced -- it only fires when BOTH are reals."""
+    if a == b:
+        return True
+    fa, fb = _as_real_text(a), _as_real_text(b)
+    if fa is None or fb is None:
+        return False
+    return ("%.15g" % fa) == ("%.15g" % fb)
+
+
 def normalize_value(value: Any, cli_text: bool = False) -> str:
     """Map any cell to a canonical string so type-affinity/float-format noise does not
     masquerade as a differential. Ints and integral floats collapse to the same form.
@@ -774,11 +814,9 @@ def normalize_value(value: Any, cli_text: bool = False) -> str:
     transport, not a product-behavior suppression. It applies symmetrically and never
     hides a value difference, only the type tag the transport physically cannot carry."""
     # CLI cells arrive already in the CLI's text projection; never re-guess their type.
-    # (We deliberately do NOT collapse integral-float text like "0.0" here: a CLI cell of
-    # "0.0" can be a genuine TEXT result -- e.g. lower(0.0) -> '0.0' -- and collapsing it to
-    # "0" would mask a real text difference. A candidate rendering an empty aggregate as
-    # "0.0" where the reference yields typed 0 is left as a real differential for the
-    # orchestrator to adjudicate, not silently normalized away.)
+    # Float-precision reconciliation is NOT done here (a context-free cell like the hex text
+    # '302E30' from hex(0.0) must not be mis-parsed as 3.02e+32); it is done pairwise against
+    # the matching reference cell in _rows_equal, where both sides being REAL is established.
     if isinstance(value, _CliText):
         return str.__str__(value)
     if value is None:
@@ -792,16 +830,41 @@ def normalize_value(value: Any, cli_text: bool = False) -> str:
             return "nan" if cli_text else "\x00NAN"
         if value in (float("inf"), float("-inf")):
             return ("inf" if value > 0 else "-inf") if cli_text else f"\x00REAL:{value!r}"
+        # cli_text: render the reference REAL at shortest-roundtrip (repr), KEEPING a
+        # trailing ".0" on integral reals -- we NO LONGER collapse REAL 0.0 to "0" (that
+        # collapse was the harness bug that fired reds #2/#3/#6: total(), round(zeroblob),
+        # round(emoji) all yield REAL 0.0). Residual precision/format splits vs the candidate
+        # (17-vs-15-digit, 1e+308 vs 1.0e+308) are reconciled numerically in _rows_equal.
+        if cli_text:
+            return repr(value)
         if abs(value) < 1e15 and value == int(value):
-            iv = int(value)
-            return str(iv) if cli_text else f"\x00INT:{iv}"
-        return (repr(value) if cli_text else f"\x00REAL:{value!r}")
+            return f"\x00INT:{int(value)}"
+        return f"\x00REAL:{value!r}"
     if isinstance(value, bytes):
-        # sqlite3 returns a Python bytes for a blob; the CLI prints its hex. Compare on
-        # hex so a blob on the reference matches the CLI's hex rendering of the same blob.
-        return value.hex() if cli_text else "\x00BLOB:" + value.hex()
+        if not cli_text:
+            return "\x00BLOB:" + value.hex()
+        # cli_text: render the reference blob EXACTLY as `-m list` renders the candidate
+        # blob, so the same blob is the same text on both sides. `-m list` prints a BLOB's
+        # RAW bytes; on our side, _coerce_cli_cell hex-encodes any candidate cell carrying
+        # raw (non-clean-UTF8) bytes. So mirror that here: if the blob's bytes are clean
+        # printable UTF-8 text (e.g. x'414243' -> 'ABC'), the CLI prints that text verbatim
+        # and we compare as text; otherwise the candidate cell became hex, so we hex too.
+        try:
+            decoded = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value.hex()
+        return decoded if not _has_raw_bytes(decoded) else value.hex()
     # str
-    return str(value) if cli_text else "\x00TXT:" + str(value)
+    if not cli_text:
+        return "\x00TXT:" + str(value)
+    s = str(value)
+    # A reference TEXT cell can carry raw bytes -- NULs from a zeroblob concatenated into a
+    # group_concat, or a U+FFFD from decode-replacing a non-UTF8 byte fed to upper()/trim().
+    # `-m list` prints those bytes raw and the candidate cell was hex-encoded by
+    # _coerce_cli_cell, so hex-encode the reference the SAME way to keep both sides canonical.
+    if _has_raw_bytes(s):
+        return s.encode("utf-8", "surrogateescape").hex()
+    return s
 
 
 def normalize_row(row: tuple, cli_text: bool = False) -> tuple:
@@ -812,6 +875,26 @@ def normalize_rowset(rows: list[tuple], cli_text: bool = False) -> list[tuple]:
     """Multiset compare: sort normalized rows so row ORDER never triggers a false red
     (only ORDER BY queries would care, and those are compared as multisets too here)."""
     return sorted(normalize_row(r, cli_text) for r in rows)
+
+
+def _rows_equal(rref: list[tuple], rcand: list[tuple]) -> bool:
+    """Multiset equality of two normalized rowsets, cell-comparison being _cells_equal (so
+    float print-format differences reconcile). Same length required; each ref row must be
+    matched one-to-one to a cand row. Rowsets are small (query results), so an O(n*m) greedy
+    match is fine. Falls back to exact list equality fast-path first."""
+    if rref == rcand:
+        return True
+    if len(rref) != len(rcand):
+        return False
+    remaining = list(rcand)
+    for rr in rref:
+        for j, rc in enumerate(remaining):
+            if len(rr) == len(rc) and all(_cells_equal(x, y) for x, y in zip(rr, rc)):
+                remaining.pop(j)
+                break
+        else:
+            return False
+    return True
 
 
 # ---- sqlite3 reference runner ----
@@ -825,7 +908,7 @@ class Sqlite3Runner(Runner):
         self.name = tag
 
     @staticmethod
-    def _connect(db_path: str) -> sqlite3.Connection:
+    def _connect(db_path: str, config: Optional[dict[str, Any]] = None) -> sqlite3.Connection:
         conn = sqlite3.connect(db_path, isolation_level=None)
         # Decode-tolerant text factory: some queries (e.g. group_concat over a column that
         # ended up holding non-UTF8 bytes) produce a result Python's default TEXT decoder
@@ -834,6 +917,17 @@ class Sqlite3Runner(Runner):
         # the CLI's own rendering) rather than spuriously "rejecting" a statement the CLI
         # accepts. Bytes that are valid UTF-8 decode unchanged, so normal text is unaffected.
         conn.text_factory = lambda b: b.decode("utf-8", "replace")
+        # Realize the swept config once at open, symmetric with the CliRunner preamble. On the
+        # reference the connection is reused, so applying config here (before the first write)
+        # is what makes page_size bind; the others just set the mode. Idempotent on reopen
+        # (page_size is a no-op once the db exists; journal/sync/fk re-set harmlessly).
+        if config:
+            for pragma in ("page_size", "journal_mode", "synchronous", "foreign_keys"):
+                if pragma in config:
+                    try:
+                        conn.execute(f"PRAGMA {pragma} = {config[pragma]};").fetchall()
+                    except sqlite3.Error:
+                        pass
         return conn
 
     def _aux_path(self, seed: int, alias: str) -> str:
@@ -850,18 +944,24 @@ class Sqlite3Runner(Runner):
         for aux in self.run_dir.glob(f"{self.name}-{program.seed}-*.auxdb"):
             aux.unlink(missing_ok=True)
         result = RunResult()
-        conn = self._connect(str(db_path))
+        conn = self._connect(str(db_path), program.config)
         try:
             for op in program.ops:
                 if op.kind == "reopen":
                     conn.close()
-                    conn = self._connect(str(db_path))
+                    conn = self._connect(str(db_path), program.config)
                     continue
                 self._exec_one(conn, op, result, program.seed)
+            # config-realized proof: read page_size back (recorded, not compared)
+            try:
+                pr = conn.execute("PRAGMA page_size;").fetchall()
+                result.page_size_readback = str(pr[0][0]) if pr and pr[0] else ""
+            except sqlite3.Error:
+                pass
             # terminal reopen probe
             conn.close()
             try:
-                conn = self._connect(str(db_path))
+                conn = self._connect(str(db_path), program.config)
                 conn.execute("PRAGMA integrity_check;").fetchall()
                 result.reopened_ok = True
             except sqlite3.Error:
@@ -941,8 +1041,14 @@ class CliRunner(Runner):
         return [*head, "-q", "-m", "list", *self.base_args, db, script]
 
     def _subprocess_spawn(self, argv: list[str], _script: str) -> tuple[int, str, str]:  # pragma: no cover
-        proc = subprocess.run(argv, text=True, capture_output=True, timeout=self.timeout, check=False)
-        return proc.returncode, proc.stdout, proc.stderr
+        # Capture as BYTES, then decode with surrogateescape so raw blob bytes that `-m list`
+        # emits (non-UTF8, e.g. 0x00/0xff) survive into the string instead of being replaced
+        # or raising. _coerce_cli_cell hex-encodes any cell carrying such bytes so it matches
+        # the reference's `.hex()` rendering of the same blob. Clean UTF-8 text is unaffected.
+        proc = subprocess.run(argv, capture_output=True, timeout=self.timeout, check=False)
+        out = proc.stdout.decode("utf-8", "surrogateescape")
+        err = proc.stderr.decode("utf-8", "surrogateescape")
+        return proc.returncode, out, err
 
     def _aux_path(self, seed: int, alias: str) -> str:
         return str(self.run_dir / f"{self.name}-{seed}-{alias}.auxdb")
@@ -958,6 +1064,31 @@ class CliRunner(Runner):
         if self.encryption and self.cipher and self.hexkey:
             return f"file:{db_path}?cipher={self.cipher}&hexkey={self.hexkey}"
         return db_path
+
+    @staticmethod
+    def _config_preamble(config: dict[str, Any]) -> list[str]:
+        """Config-realizing pragmas, prepended to EVERY invocation.
+
+        The transport is one-statement-per-process, so the process that first writes the db
+        is the one that must carry `PRAGMA page_size` -- `page_size` only binds if it runs
+        before the db file is created (SQLite/tursodb semantics). Emitting these pragmas as a
+        one-time program op (as generate() does) is useless here: that op ran in its own
+        write-less process and exited, and the CREATE that actually made the db ran later at
+        the DEFAULT page size -- so the swept page_size x encryption combo (WP-025 / turso
+        #7610) never bound. Prepending them to every statement makes them load-bearing on
+        whichever invocation first creates the db, and harmlessly idempotent thereafter
+        (page_size is silently ignored once the db exists; the others just re-set the mode).
+        Generic: driven entirely by the swept config dict, no target-specific tuple."""
+        pre: list[str] = []
+        if "page_size" in config:
+            pre.append(f"PRAGMA page_size = {config['page_size']};")
+        if "journal_mode" in config:
+            pre.append(f"PRAGMA journal_mode = {config['journal_mode']};")
+        if "synchronous" in config:
+            pre.append(f"PRAGMA synchronous = {config['synchronous']};")
+        if "foreign_keys" in config:
+            pre.append(f"PRAGMA foreign_keys = {config['foreign_keys']};")
+        return pre
 
     def run(self, program: Program) -> RunResult:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -975,6 +1106,11 @@ class CliRunner(Runner):
         # subsequent statement (so `aux.tbl` resolves) until the matching DETACH or a
         # reopen clears it. This makes the one-statement-per-process transport faithfully
         # reproduce a persistent-connection ATTACH session -- generic, not target-specific.
+        # Config-realizing pragmas, prepended to EVERY invocation (the write-less-process
+        # flaw fix -- see _config_preamble). They echo (`journal_mode` prints the mode), so a
+        # sentinel SELECT separates their output from the real statement's rows; everything
+        # up to and including the sentinel line is discarded before parsing.
+        config_preamble = self._config_preamble(program.config)
         attach_preamble: list[str] = []
         for op in program.ops:
             if op.kind == "reopen":
@@ -983,8 +1119,7 @@ class CliRunner(Runner):
             stmt_sql = self._subst_aux(op.sql, program.seed)
             if op.kind == "attach" and stmt_sql.strip().upper().startswith("DETACH"):
                 # Execute the detach (with current preamble) then drop it from the preamble.
-                body = "".join(s + "\n" for s in attach_preamble) + stmt_sql
-                rc, stdout, stderr = self._spawn(self.argv(db_path, self._script_for(body)), body)
+                rc, stdout, stderr = self._spawn_stmt(db_path, config_preamble, attach_preamble, stmt_sql)
                 attach_preamble = [s for s in attach_preamble if not self._same_attach(s, op.sql)]
                 combined = f"{stdout}\n{stderr}"
                 if self._is_crash(rc, combined):
@@ -994,9 +1129,7 @@ class CliRunner(Runner):
                     break
                 result.stmts.append(StmtResult(stmt_sql, 0 if rc == 0 else 1, [], "" if rc == 0 else stderr.strip(), op.ref_comparable))
                 continue
-            body = "".join(s + "\n" for s in attach_preamble) + stmt_sql
-            script = self._script_for(body)
-            rc, stdout, stderr = self._spawn(self.argv(db_path, script), script)
+            rc, stdout, stderr = self._spawn_stmt(db_path, config_preamble, attach_preamble, stmt_sql)
             combined = f"{stdout}\n{stderr}"
             if self._is_crash(rc, combined):
                 result.crashed = True
@@ -1009,11 +1142,45 @@ class CliRunner(Runner):
                 attach_preamble.append(stmt_sql)
             if op.kind in ("integrity_check", "fts_integrity", "attach_integrity") and rc == 0:
                 result.integrity_ok = any(r and str(r[0]).lower() == "ok" for r in rows)
+        # verify_config: read page_size back after a run so a sweep can SEE the config took
+        # effect (ref_comparable=False -- recorded, not differentially compared). This is the
+        # cheap generic probe that the swept page_size actually bound under this config.
+        rc, stdout, stderr = self._spawn_stmt(db_path, config_preamble, [], "PRAGMA page_size;")
+        if rc == 0 and not self._is_crash(rc, f"{stdout}\n{stderr}"):
+            prows = self._parse_rows(stdout)
+            result.page_size_readback = str(prows[0][0]) if prows and prows[0] else ""
         # terminal reopen probe
-        script = self._script_for("PRAGMA integrity_check;")
-        rc, stdout, stderr = self._spawn(self.argv(db_path, script), script)
+        rc, stdout, stderr = self._spawn_stmt(db_path, config_preamble, [], "PRAGMA integrity_check;")
         result.reopened_ok = rc == 0 and not self._is_crash(rc, f"{stdout}\n{stderr}")
         return result
+
+    _SENTINEL = "__cfg_end_9f3a__"
+
+    def _spawn_stmt(
+        self, db_path: str, config_preamble: list[str], attach_preamble: list[str], stmt_sql: str
+    ) -> tuple[int, str, str]:
+        """Run ONE statement in a fresh process, prefixed by the config-realizing pragmas and
+        any active ATTACHes. A sentinel SELECT sits between the preamble and the real
+        statement; stdout up to and including the sentinel line is stripped so preamble echo
+        (e.g. `journal_mode` -> 'wal') never masquerades as the statement's result rows."""
+        preamble_lines = list(config_preamble) + [f"SELECT '{self._SENTINEL}';"] + list(attach_preamble)
+        body = "".join(s + "\n" for s in preamble_lines) + stmt_sql
+        script = self._script_for(body)
+        rc, stdout, stderr = self._spawn(self.argv(db_path, script), script)
+        if config_preamble:
+            stdout = self._strip_to_sentinel(stdout)
+        return rc, stdout, stderr
+
+    @classmethod
+    def _strip_to_sentinel(cls, stdout: str) -> str:
+        """Drop everything up to and including the sentinel line, leaving only the real
+        statement's output. If the sentinel is absent (statement errored before reaching it),
+        return stdout unchanged so error text is still visible to the crash/error oracles."""
+        marker = cls._SENTINEL + "\n"
+        idx = stdout.find(marker)
+        if idx == -1:
+            return stdout
+        return stdout[idx + len(marker):]
 
     @staticmethod
     def _same_attach(preamble_stmt: str, detach_sql: str) -> bool:
@@ -1070,10 +1237,32 @@ def _coerce_cli_cell(cell: str) -> Any:
     """A CLI text cell is untyped: empty string means NULL, everything else is opaque text
     in the CLI's own projection. We do NOT guess int/real/blob here -- guessing is what let
     a blob's hex (all digits) masquerade as an integer. Comparison happens in cli_text mode
-    where the reference side is rendered the same way."""
+    where the reference side is rendered the same way.
+
+    Raw-blob bytes: `-m list` prints a BLOB as its raw bytes. Captured via surrogateescape,
+    non-UTF8 blob bytes appear as surrogate-escaped chars (or bare control bytes). When a
+    cell carries such bytes we hex-encode it so it compares against the reference's `.hex()`
+    of the same blob -- normalizing BOTH sides to one canonical hex form (fix for red #5).
+    A cell that is clean printable text is left verbatim."""
     if cell == "":
         return None
+    if _has_raw_bytes(cell):
+        raw = cell.encode("utf-8", "surrogateescape")
+        return _CliText(raw.hex())
     return _CliText(cell)
+
+
+def _has_raw_bytes(cell: str) -> bool:
+    """True if the cell carries bytes that are NOT clean printable text -- i.e. it is a raw
+    BLOB projection (surrogate-escaped non-UTF8 bytes, NULs, or other C0 controls except the
+    tab that `-m list` legitimately passes through inside a text value)."""
+    for ch in cell:
+        o = ord(ch)
+        if 0xDC80 <= o <= 0xDCFF:   # surrogateescape of a non-UTF8 byte
+            return True
+        if o < 0x20 and ch != "\t":  # NUL / control byte from a raw blob
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1185,7 +1374,7 @@ def oracle_diff_rows(ref: RunResult, cand: RunResult, cli_text: bool = False) ->
             continue  # error-class oracle owns accept/reject disagreements
         rref = normalize_rowset(r.rows, cli_text)
         rcand = normalize_rowset(c.rows, cli_text)
-        if rref != rcand:
+        if not _rows_equal(rref, rcand):
             d = match_divergence(c.sql, "")
             if d is not None:
                 return Finding("diff_rows", True, f"suppressed stmt={c.sql!r}", d.id)
