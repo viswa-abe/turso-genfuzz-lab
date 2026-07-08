@@ -938,23 +938,39 @@ def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
     return ops
 
 
-# Scalar functions whose RESULT is persisted to a table then read back after reopen
+# Scalar functions whose RESULT is persisted to the UNTYPED r_any column then read back BARE
 # (EXP-109 lever 3). A generic sweep of the scalar-function grammar over the boundary pool;
 # WP-015 (zeroblob / numeric-prefix persisted-value divergence) is ONE inhabitant, not pinned.
 # Rendered by `_render_scalar_persist` so each takes a swept boundary value as its argument.
-SCALAR_PERSIST_FUNCS: tuple[str, ...] = (
-    "zeroblob", "hex", "quote", "cast_int", "cast_real", "cast_text", "abs", "round2",
-    "length", "substr3", "replace3", "typeof", "upper", "trim",
+# EXP-109c/d transport rule: the r_any column is read BARE (REAL-provenance-safe, reconciles
+# 17-vs-15-digit REAL splits). So this pool must NOT contain a scalar that renders a NUMERIC
+# input as representation-dependent TEXT with NO REAL provenance -- specifically `quote` and
+# `hex`, whose result over an overflow-int-turned-REAL is engine-specific text ('9.2233..758e18'
+# vs '9.22..581e18') stored as a plain string that cannot reconcile (a cross-engine float-format
+# difference, not a WP-015 value divergence). `quote`/`hex` still ARE exercised -- in the
+# BLOBTEXT_SCALAR_FUNCS pool over text-only inputs, where their output is deterministic and read
+# back via quote() transport-safely. abs/round/cast_real DO produce REALs but land in r_any as
+# a genuine REAL cell (typeof=real), so they reconcile by provenance.
+# NUMERIC-result scalars: result is a genuine INT/REAL (or fixed short text like typeof), so
+# stored in r_any it reads back with type provenance and reconciles even for the overflow REAL
+# (bare projection carries _RealText). These take the FULL boundary pool as argument -- this is
+# where WP-015's overflow / numeric-prefix / boundary VALUES are persisted and compared.
+SCALAR_PERSIST_NUMERIC_FUNCS: tuple[str, ...] = (
+    "cast_int", "cast_real", "abs", "round2", "length", "typeof",
 )
+# TEXT-result scalars: result is a STRING with no REAL provenance, so it must be fed CLEAN TEXT
+# only (a text-boundary value) -- otherwise stringifying the overflow REAL yields engine-specific
+# digits that cannot reconcile (the EXP-109d false red). Over clean text they are deterministic.
+SCALAR_PERSIST_TEXT_FUNCS: tuple[str, ...] = (
+    "cast_text", "substr3", "replace3", "upper", "trim",
+)
+# Back-compat alias (some probes reference the union); the two pools together are the sweep.
+SCALAR_PERSIST_FUNCS: tuple[str, ...] = SCALAR_PERSIST_NUMERIC_FUNCS + SCALAR_PERSIST_TEXT_FUNCS
 
 
 def _render_scalar_persist(fn: str, val: str) -> str:
     """Render a scalar-function call over one boundary literal `val` -- the value whose
     persisted round-trip is under test. Generic grammar sweep, no target tuple."""
-    if fn == "zeroblob":
-        # zeroblob wants an int size; drive it over a swept small-int size pool via abs()
-        # of the value so it stays a valid size, and also cover the literal sizes 0/1/4096.
-        return f"zeroblob(abs(round({val})) % 4097)"
     if fn == "cast_int":
         return f"CAST({val} AS INTEGER)"
     if fn == "cast_real":
@@ -975,7 +991,11 @@ ZEROBLOB_SIZES: tuple[int, ...] = (0, 1, 4096)
 
 
 # Scalar functions whose result is a genuine BLOB or TEXT -- safe to read back via quote()
-# without hitting the quote(REAL) digit-count divergence. Only these feed the r_blob column.
+# without hitting the quote(REAL) digit-count divergence. Only these feed the r_blobtext column,
+# and ONLY over text-only inputs (_text_boundary), so `quote`/`hex` render a deterministic,
+# engine-identical string (quote/hex of clean text has no float-format ambiguity). This is where
+# `quote`/`hex` ARE swept -- moved out of the bare r_any pool where a numeric input made them
+# render engine-specific REAL text (the EXP-109d smoke false red).
 BLOBTEXT_SCALAR_FUNCS: tuple[str, ...] = ("hex", "quote", "cast_text", "upper", "lower", "trim")
 
 
@@ -1004,11 +1024,17 @@ def _gen_scalar_persist(rng: random.Random) -> list[Op]:
     n = rng.randint(3, 6)
     rows = []
     for i in range(n):
-        fn = SCALAR_PERSIST_FUNCS[rng.randrange(len(SCALAR_PERSIST_FUNCS))]
-        val = render_literal(_pool_value(rng))
+        # r_any: a NUMERIC-result scalar over the FULL boundary pool (overflow/numeric-prefix/
+        # boundary VALUES -- the WP-015 surface), read back bare (typed -> reconciles), OR a
+        # TEXT-result scalar over CLEAN TEXT only (deterministic string, no float-format hazard).
+        if rng.random() < 0.6:
+            fn = SCALAR_PERSIST_NUMERIC_FUNCS[rng.randrange(len(SCALAR_PERSIST_NUMERIC_FUNCS))]
+            val = render_literal(_pool_value(rng))
+        else:
+            fn = SCALAR_PERSIST_TEXT_FUNCS[rng.randrange(len(SCALAR_PERSIST_TEXT_FUNCS))]
+            val = render_literal(_text_boundary(rng))
         expr = _render_scalar_persist(fn, val)
-        # r_any: the full scalar sweep (any type), read back bare (REAL-provenance-safe).
-        # r_blobtext: only a genuine BLOB/TEXT scalar (quote()-safe), over its own swept value.
+        # r_blobtext: only a genuine BLOB/TEXT scalar (quote()-safe), over a text-only value.
         btfn = BLOBTEXT_SCALAR_FUNCS[rng.randrange(len(BLOBTEXT_SCALAR_FUNCS))]
         btval = render_literal(_text_boundary(rng))  # text-only so the result stays TEXT/BLOB
         btexpr = _render_scalar_persist(btfn, btval)
@@ -1305,7 +1331,7 @@ def normalize_value(value: Any, cli_text: bool = False) -> str:
     # '302E30' from hex(0.0) must not be mis-parsed as 3.02e+32); it is done pairwise against
     # the matching reference cell in _rows_equal, where both sides being REAL is established.
     if isinstance(value, _CliText):
-        return str.__str__(value)
+        return _canon_ieee_special(str.__str__(value))
     if value is None:
         return "" if cli_text else "\x00NULL"
     if isinstance(value, bool):
@@ -1316,6 +1342,8 @@ def normalize_value(value: Any, cli_text: bool = False) -> str:
         if value != value:
             return "nan" if cli_text else "\x00NAN"
         if value in (float("inf"), float("-inf")):
+            # cli_text canonical is lowercase 'inf'/'-inf'; the candidate CLI glyph is folded
+            # to the same by _canon_ieee_special (tursodb emits 'Inf', sqlite3/Python 'inf').
             return ("inf" if value > 0 else "-inf") if cli_text else f"\x00REAL:{value!r}"
         # cli_text: render the reference REAL at shortest-roundtrip (repr), KEEPING a
         # trailing ".0" on integral reals -- we NO LONGER collapse REAL 0.0 to "0" (that
@@ -1782,6 +1810,23 @@ def _has_raw_bytes(cell: str) -> bool:
         if o < 0x20 and ch != "\t":  # NUL / control byte from a raw blob
             return True
     return False
+
+
+# IEEE special-value glyphs the two engines render with different capitalization: tursodb
+# `-m list` emits 'Inf'/'-Inf'/'NaN'; sqlite3/Python emit 'inf'/'-inf'/'nan'. Both denote the
+# SAME IEEE value, so a bare projection of a stored/aggregated infinity (total()/avg() over
+# 1e308 rows, EXP-109 smoke) differs only in the glyph case -- a transport artifact, not a
+# product divergence. Canonicalize to one lowercase form. This is normalization (the EXP-102
+# discipline), NOT allowlisting: only the exact special-value token is folded; any other text
+# ('Info', 'Infinity5', a value that merely starts with these letters) is left untouched.
+_IEEE_SPECIALS = {
+    "inf": "inf", "+inf": "inf", "-inf": "-inf",
+    "nan": "nan", "+nan": "nan", "-nan": "nan",
+}
+
+
+def _canon_ieee_special(cell: str) -> str:
+    return _IEEE_SPECIALS.get(cell.lower(), cell)
 
 
 # ---------------------------------------------------------------------------
