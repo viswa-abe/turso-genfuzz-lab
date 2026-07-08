@@ -653,10 +653,17 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
     ops: list[Op] = []
 
     # Always begin with pragmas realizing the swept config so the config is load-bearing.
-    ops.append(Op("LIFECYCLE", "pragma_page_size", f"PRAGMA page_size = {config['page_size']};"))
-    ops.append(Op("LIFECYCLE", "pragma_journal", f"PRAGMA journal_mode = {config['journal_mode']};"))
-    ops.append(Op("LIFECYCLE", "pragma_sync", f"PRAGMA synchronous = {config['synchronous']};"))
-    ops.append(Op("LIFECYCLE", "pragma_fk", f"PRAGMA foreign_keys = {config['foreign_keys']};"))
+    # These config-realizing PRAGMAs ECHO the resulting mode, and engines legitimately
+    # differ on the echo (tursodb is WAL-only, so `PRAGMA journal_mode = <x>` echoes 'wal'
+    # for every requested mode; sqlite3 echoes the requested mode). That echo is a config
+    # realization, not a query result under test, so the config PRAGMAs are marked
+    # ref_comparable=False -- they still execute and realize the config, but their echoed
+    # row is not differentially compared. (Real WP-025-style panics under a given config
+    # still surface via the universal panic/terminal oracles, which bind regardless.)
+    ops.append(Op("LIFECYCLE", "pragma_page_size", f"PRAGMA page_size = {config['page_size']};", ref_comparable=False))
+    ops.append(Op("LIFECYCLE", "pragma_journal", f"PRAGMA journal_mode = {config['journal_mode']};", ref_comparable=False))
+    ops.append(Op("LIFECYCLE", "pragma_sync", f"PRAGMA synchronous = {config['synchronous']};", ref_comparable=False))
+    ops.append(Op("LIFECYCLE", "pragma_fk", f"PRAGMA foreign_keys = {config['foreign_keys']};", ref_comparable=False))
 
     n_ddl = rng.randint(2, 3)
     for _ in range(n_ddl):
@@ -1191,14 +1198,16 @@ class CaseResult:
 
 
 def _plant_corruption(ref: RunResult) -> None:
-    """ORACLE_SELFTEST: mutate the reference so an oracle MUST fire RED. We drop a row
-    from the first accepted SELECT that returned rows; if none, flip an accept to reject."""
+    """ORACLE_SELFTEST: mutate the reference so a DIFFERENTIAL oracle MUST fire RED. We
+    only mutate REF-COMPARABLE statements (the differential oracles skip non-comparable
+    ones, so corrupting those would not be caught). Drop a row from the first accepted,
+    comparable SELECT that returned rows; if none, flip an accept to reject."""
     for st in ref.stmts:
-        if st.rc == 0 and st.rows:
+        if st.ref_comparable and st.rc == 0 and st.rows:
             st.rows = st.rows[1:]
             return
     for st in ref.stmts:
-        if st.rc == 0:
+        if st.ref_comparable and st.rc == 0:
             st.rc = 1
             st.error = "SELFTEST: planted rejection"
             return
