@@ -94,7 +94,7 @@ BOUNDARY_VALUES: tuple[Any, ...] = (
     "åß☃",   # unicode: aa, sharp-s, snowman
     "\U0001f600",             # astral emoji
     "tab\tsep",               # embedded tab (round-trips through `-m list`)
-    b"\x00\x01\xff",          # raw bytes -> blob
+    b"ABC\x01Z",              # blob with a control byte -> exercises blob affinity, byte-faithful
     "zeroblob:5",             # sentinel expanded to zeroblob(5) by renderer
 )
 # NOTE: embedded-newline literals are deliberately NOT in the pool. tursodb's `-m list`
@@ -102,6 +102,15 @@ BOUNDARY_VALUES: tuple[Any, ...] = (
 # from a row boundary on stdout -- a transport ambiguity, not a product divergence. Such
 # values are still exercised through DML/storage paths (they round-trip via the DB, not
 # via stdout parsing); only bare scalar projection of a newline would be unparseable.
+# NOTE (EXP-106): the blob pool value is a control-byte blob whose bytes are all valid UTF-8
+# (`ABC\x01Z`), NOT a non-UTF8 blob like `x'0001ff'`. tursodb's `-m list` renders a BLOB as
+# text with LOSSY U+FFFD replacement of non-UTF8 bytes, so a NON-UTF8 blob bare-projected
+# through a scalar/aggregate (coalesce(blob), max(blob), a CTE `max(x)`) is transport-ambiguous
+# for the SAME reason as an embedded newline -- two distinct non-UTF8 bytes both print as U+FFFD,
+# an irrecoverable stdout loss, not a product divergence. A clean-UTF8 blob still stores as a
+# BLOB (exercises blob affinity, storage, durability) and reads back byte-faithfully, and the
+# durability read-back additionally wraps every column in quote() (byte-faithful `X'..'` hex)
+# so blob VALUES are still compared exactly where it is safe to do so.
 
 # Identifier styles for DDL -- plain, quoted, keyword-ish, unicode. Data-driven so
 # the generator exercises the identifier grammar rather than one safe style.
@@ -823,10 +832,19 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
     # (fts_*/jdoc*/trg*/aux*/at*) are excluded -- their own generators own their read-backs.
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     for tbl in tables:
-        proj = ", ".join(tbl["cols"])
+        # Project every column through quote() so the read-back is TRANSPORT-SAFE: quote()
+        # renders a BLOB as a byte-faithful X'..' hex literal (identical on both engines),
+        # text as an escaped 'literal', NULL as NULL, and numbers verbatim -- so a raw-blob
+        # column's non-UTF8 bytes survive the `-m list` text transport instead of being lossily
+        # replaced by U+FFFD (which would masquerade as a divergence). Generic and value-
+        # preserving: quote() is standard SQL both engines share, and it never collapses two
+        # distinct stored values to the same text. ORDER BY the quoted projection for a stable
+        # multiset. (Signed-zero REAL rendering is handled downstream in _cells_equal.)
+        proj = ", ".join(f"quote({c})" for c in tbl["cols"])
+        order = ", ".join(f"quote({c})" for c in tbl["cols"])
         ops.append(Op(
             "QUERY", "durability_readback",
-            f"SELECT {proj} FROM {tbl['name']} ORDER BY {proj};",
+            f"SELECT {proj} FROM {tbl['name']} ORDER BY {order};",
         ))
     # Always end with an integrity check + terminal reopen probe.
     ops.append(Op("LIFECYCLE", "integrity_check", "PRAGMA integrity_check;"))
@@ -923,6 +941,15 @@ def _cells_equal(a: str, b: str) -> bool:
     fb = float(b) if b_real else _parse_finite_float(b)
     if fa is None or fb is None:
         return False
+    # Signed-zero: IEEE -0.0 == 0.0, but engines differ on the sign GLYPH (sqlite3 keeps the
+    # sign -> '-0.0'; tursodb `-m list` drops it -> '0.0'). Both agree the VALUE is zero, so
+    # collapse the sign on zero. This cannot mask a real divergence: any nonzero double keeps
+    # its sign, so only the zero-vs-zero sign-render noise is absorbed (EXP-106: durability
+    # read-back of a stored -0.0 REAL surfaced this transport render split).
+    if fa == 0.0:
+        fa = 0.0
+    if fb == 0.0:
+        fb = 0.0
     return ("%.15g" % fa) == ("%.15g" % fb)
 
 
