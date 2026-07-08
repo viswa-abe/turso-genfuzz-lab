@@ -766,17 +766,26 @@ class Runner:
 _REAL_TEXT_RE = re.compile(r"[+-]?(\d+\.\d*|\.\d+|\d+)([eE][+-]?\d+)?")
 
 
-def _as_real_text(cell: str) -> Optional[float]:
-    """If a normalized cell is a REAL *rendering* (has a '.' or exponent and parses as a
-    finite float), return that float; else None. Requiring a '.'/exponent means a bare
-    integer ('42') and non-float text ('12abc', or hex like '302E30' from hex(0.0)) are NOT
-    treated as reals -- so pairwise float reconciliation only fires when BOTH sides really
-    are REAL renderings of the same value at different precisions."""
+class _RealText(str):
+    """A normalized cell that PROVABLY came from a REAL (float) column on the reference side.
+    Only these carry the type provenance that licenses `%!.15g` float reconciliation against
+    the candidate; a genuine TEXT cell that merely looks numeric (e.g. lower('0.10') -> TEXT
+    '0.10') is a plain str and is compared byte-exactly, so a real text-format divergence
+    ('0.1' vs '0.10') is NEVER masked. The candidate side is untyped CLI text, so provenance
+    is anchored on the reference (typed Python) side -- reconciliation fires iff the REFERENCE
+    cell is a known REAL and the candidate text parses as the same double at 15 sig-digits."""
+    __slots__ = ()
+
+
+def _parse_finite_float(cell: str) -> Optional[float]:
+    """Parse a cell as a finite float IFF it is a decimal-number rendering (has a '.' or
+    exponent -- so a bare integer '42' and non-numeric/hex text like '302E30' are rejected).
+    Returns None otherwise. Used only for the candidate side of a REAL reconciliation."""
     t = cell.strip()
     if not _REAL_TEXT_RE.fullmatch(t):
         return None
     if "." not in t and "e" not in t and "E" not in t:
-        return None  # bare integer -- compare exactly, don't float-reconcile
+        return None  # bare integer -- compare exactly, never float-reconcile
     try:
         f = float(t)
     except (ValueError, OverflowError):
@@ -787,16 +796,22 @@ def _as_real_text(cell: str) -> Optional[float]:
 
 
 def _cells_equal(a: str, b: str) -> bool:
-    """Two normalized cells are equal if they are byte-identical OR both are REAL renderings
-    that agree to 15 significant digits (SQLite's own `%!.15g` float-print precision). The
-    15-sig-digit reconciliation is what makes tursodb's shortest-roundtrip REAL (17 digits,
-    '1.0e+308') compare equal to the reference's differently-rendered SAME double -- purely a
-    print-format difference, not a value difference (a genuinely different double diverges
-    within 15 sig-digits and still reds). Applied pairwise so a hex/text cell that merely
-    looks float-ish (e.g. '302E30') is never coerced -- it only fires when BOTH are reals."""
+    """Two normalized cells are equal if byte-identical, OR one side is a provably-REAL
+    reference cell (`_RealText`) and the other parses as the SAME double to 15 significant
+    digits (SQLite's own `%!.15g` float-print precision). Gating on `_RealText` provenance is
+    what keeps this from masking a genuine TEXT-format divergence: reconciliation only fires
+    when the reference cell truly came from a REAL column, so '0.1' vs '0.10' as genuine TEXT
+    (neither a `_RealText`) stays a red. The 15-sig-digit tolerance only absorbs print-format
+    noise (tursodb's 17-digit shortest-roundtrip vs the reference's rendering of the SAME
+    double); a genuinely different double diverges within 15 sig-digits and still reds."""
     if a == b:
         return True
-    fa, fb = _as_real_text(a), _as_real_text(b)
+    a_real = isinstance(a, _RealText)
+    b_real = isinstance(b, _RealText)
+    if not (a_real or b_real):
+        return False  # no REAL provenance on either side -> exact text compare already failed
+    fa = float(a) if a_real else _parse_finite_float(a)
+    fb = float(b) if b_real else _parse_finite_float(b)
     if fa is None or fb is None:
         return False
     return ("%.15g" % fa) == ("%.15g" % fb)
@@ -833,10 +848,11 @@ def normalize_value(value: Any, cli_text: bool = False) -> str:
         # cli_text: render the reference REAL at shortest-roundtrip (repr), KEEPING a
         # trailing ".0" on integral reals -- we NO LONGER collapse REAL 0.0 to "0" (that
         # collapse was the harness bug that fired reds #2/#3/#6: total(), round(zeroblob),
-        # round(emoji) all yield REAL 0.0). Residual precision/format splits vs the candidate
-        # (17-vs-15-digit, 1e+308 vs 1.0e+308) are reconciled numerically in _rows_equal.
+        # round(emoji) all yield REAL 0.0). Tag it `_RealText` so _cells_equal knows this cell
+        # provably came from a REAL and may reconcile print-format splits (17-vs-15-digit,
+        # 1e+308 vs 1.0e+308) against the candidate -- a genuine TEXT '0.10' gets no such tag.
         if cli_text:
-            return repr(value)
+            return _RealText(repr(value))
         if abs(value) < 1e15 and value == int(value):
             return f"\x00INT:{int(value)}"
         return f"\x00REAL:{value!r}"
@@ -1067,18 +1083,22 @@ class CliRunner(Runner):
 
     @staticmethod
     def _config_preamble(config: dict[str, Any]) -> list[str]:
-        """Config-realizing pragmas, prepended to EVERY invocation.
+        """Config-realizing pragmas, prepended to EVERY CliRunner invocation.
 
         The transport is one-statement-per-process, so the process that first writes the db
         is the one that must carry `PRAGMA page_size` -- `page_size` only binds if it runs
-        before the db file is created (SQLite/tursodb semantics). Emitting these pragmas as a
-        one-time program op (as generate() does) is useless here: that op ran in its own
-        write-less process and exited, and the CREATE that actually made the db ran later at
-        the DEFAULT page size -- so the swept page_size x encryption combo (WP-025 / turso
-        #7610) never bound. Prepending them to every statement makes them load-bearing on
-        whichever invocation first creates the db, and harmlessly idempotent thereafter
-        (page_size is silently ignored once the db exists; the others just re-set the mode).
-        Generic: driven entirely by the swept config dict, no target-specific tuple."""
+        before the db file is created (SQLite/tursodb semantics). generate() ALSO emits these
+        pragmas as one-time program ops, but on the CliRunner that per-op form cannot bind
+        page_size: the op ran in its own write-less process and exited, and the CREATE that
+        actually made the db ran later at the DEFAULT page size -- so the swept page_size x
+        encryption combo (WP-025 / turso #7610) never bound. (Those program ops are NOT dead:
+        on the persistent-connection reference they DO realize config, and on both engines
+        they exercise the pragma statement path and anchor LIFECYCLE-family coverage; they are
+        just insufficient for the CliRunner's split-process transport.) Prepending them to
+        every statement here makes them load-bearing on whichever invocation first creates the
+        db, and harmlessly idempotent thereafter (page_size is silently ignored once the db
+        exists; the others just re-set the mode). Generic: driven entirely by the swept config
+        dict, no target-specific tuple."""
         pre: list[str] = []
         if "page_size" in config:
             pre.append(f"PRAGMA page_size = {config['page_size']};")
@@ -1162,20 +1182,37 @@ class CliRunner(Runner):
         """Run ONE statement in a fresh process, prefixed by the config-realizing pragmas and
         any active ATTACHes. A sentinel SELECT sits between the preamble and the real
         statement; stdout up to and including the sentinel line is stripped so preamble echo
-        (e.g. `journal_mode` -> 'wal') never masquerades as the statement's result rows."""
+        (e.g. `journal_mode` -> 'wal') never masquerades as the statement's result rows.
+
+        Invariant: when there is a config preamble and the process exited 0, the sentinel row
+        MUST have printed exactly once. If it did not (0 occurrences -- a formatting change or
+        an impossibly-unlucky content collision), we do NOT silently pass the polluted stdout
+        through as result rows; we surface a HARNESS-SENTINEL error on stderr so the crash/
+        error oracle flags the run loudly instead of the differential reading preamble echo as
+        query output. On a nonzero rc the statement errored before the sentinel, which is the
+        normal missing-sentinel case -- stdout is left as-is for the error/crash oracles."""
+        if not config_preamble:
+            body = "".join(s + "\n" for s in attach_preamble) + stmt_sql
+            return self._spawn(self.argv(db_path, self._script_for(body)), self._script_for(body))
         preamble_lines = list(config_preamble) + [f"SELECT '{self._SENTINEL}';"] + list(attach_preamble)
         body = "".join(s + "\n" for s in preamble_lines) + stmt_sql
         script = self._script_for(body)
         rc, stdout, stderr = self._spawn(self.argv(db_path, script), script)
-        if config_preamble:
-            stdout = self._strip_to_sentinel(stdout)
-        return rc, stdout, stderr
+        count = stdout.count(self._SENTINEL + "\n")
+        if rc == 0 and count == 0:
+            # Sentinel should have printed on a clean run -- its absence means we cannot trust
+            # which lines are the real statement's rows. Fail loud, don't guess.
+            return 1, "", f"HARNESS-SENTINEL: sentinel absent on rc=0 (stdout {len(stdout)}B)"
+        stripped = self._strip_to_sentinel(stdout)
+        return rc, stripped, stderr
 
     @classmethod
     def _strip_to_sentinel(cls, stdout: str) -> str:
-        """Drop everything up to and including the sentinel line, leaving only the real
-        statement's output. If the sentinel is absent (statement errored before reaching it),
-        return stdout unchanged so error text is still visible to the crash/error oracles."""
+        """Drop everything up to and including the FIRST sentinel line, leaving only the real
+        statement's output. The preamble runs before the real statement, so the true sentinel
+        is the first occurrence; any echo of the literal in the real statement's own output
+        comes AFTER it and is correctly preserved. If the sentinel is absent (statement errored
+        before reaching it), return stdout unchanged so error text stays visible to the oracles."""
         marker = cls._SENTINEL + "\n"
         idx = stdout.find(marker)
         if idx == -1:
