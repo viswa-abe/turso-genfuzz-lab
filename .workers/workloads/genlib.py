@@ -974,6 +974,11 @@ def _render_scalar_persist(fn: str, val: str) -> str:
 ZEROBLOB_SIZES: tuple[int, ...] = (0, 1, 4096)
 
 
+# Scalar functions whose result is a genuine BLOB or TEXT -- safe to read back via quote()
+# without hitting the quote(REAL) digit-count divergence. Only these feed the r_blob column.
+BLOBTEXT_SCALAR_FUNCS: tuple[str, ...] = ("hex", "quote", "cast_text", "upper", "lower", "trim")
+
+
 def _gen_scalar_persist(rng: random.Random) -> list[Op]:
     """EXP-109 lever 3 -- SCALAR-FUNCTION BOUNDARY PERSISTED READ-BACK. Build a table, INSERT
     rows whose columns are scalar-function calls over swept boundary values (incl. numeric-
@@ -981,35 +986,47 @@ def _gen_scalar_persist(rng: random.Random) -> list[Op]:
     values back. The differential is on the PERSISTED value after a reload -- exactly the
     WP-015 divergence a bare SELECT would miss because it never hits the on-disk path. Fully
     reference-comparable (both engines share these scalars). Generic: a swept scalar grammar
-    over the boundary pool, no pinned constant."""
+    over the boundary pool, no pinned constant.
+
+    Transport discipline (EXP-109b, smoke-surfaced): the scalar result goes in the UNTYPED
+    column `r_any` and is read back BARE -- bare projection carries REAL provenance so the
+    reference REAL gets `_RealText`-tagged and print-format splits (17-vs-15-digit) reconcile in
+    _cells_equal (the r_any column reconciled cleanly in the guest smoke). A SEPARATE column
+    `r_blobtext` holds only genuine BLOB/TEXT-producing scalars and is read back via quote()
+    (transport-safe because those never render as a REAL). quote() is DELIBERATELY NOT applied
+    to the general scalar column: quote(REAL) strips REAL provenance and prints tursodb's
+    shortest-roundtrip at a different digit count than sqlite3 -- the exact false red EXP-106
+    reverted in the durability tail. So no scalar REAL is ever projected through quote()."""
     ops: list[Op] = []
     t = _fresh_name(rng, "scal")
     ops.append(Op("DDL", "scalar_create_table",
-                  f"CREATE TABLE {t}(id INTEGER PRIMARY KEY, fn TEXT, r_blob BLOB, r_any);"))
+                  f"CREATE TABLE {t}(id INTEGER PRIMARY KEY, fn TEXT, r_any, r_blobtext);"))
     n = rng.randint(3, 6)
     rows = []
     for i in range(n):
         fn = SCALAR_PERSIST_FUNCS[rng.randrange(len(SCALAR_PERSIST_FUNCS))]
         val = render_literal(_pool_value(rng))
         expr = _render_scalar_persist(fn, val)
-        # Store the scalar result twice: once forced through a BLOB column, once through an
-        # untyped column, so both affinity paths persist and read back.
-        rows.append(f"({i + 1}, {sql_quote_str(fn)}, {expr}, {expr})")
+        # r_any: the full scalar sweep (any type), read back bare (REAL-provenance-safe).
+        # r_blobtext: only a genuine BLOB/TEXT scalar (quote()-safe), over its own swept value.
+        btfn = BLOBTEXT_SCALAR_FUNCS[rng.randrange(len(BLOBTEXT_SCALAR_FUNCS))]
+        btval = render_literal(_text_boundary(rng))  # text-only so the result stays TEXT/BLOB
+        btexpr = _render_scalar_persist(btfn, btval)
+        rows.append(f"({i + 1}, {sql_quote_str(fn)}, {expr}, {btexpr})")
     ops.append(Op("DML", "scalar_insert",
-                  f"INSERT INTO {t}(id, fn, r_blob, r_any) VALUES {', '.join(rows)};"))
-    # Also persist the explicit zeroblob boundary sizes (0/1/4096) the census names.
+                  f"INSERT INTO {t}(id, fn, r_any, r_blobtext) VALUES {', '.join(rows)};"))
+    # Also persist the explicit zeroblob boundary sizes (0/1/4096) the census names -- the
+    # zeroblob itself is a genuine BLOB (quote()-safe) in r_blobtext; r_any gets its length.
     zsize = ZEROBLOB_SIZES[rng.randrange(len(ZEROBLOB_SIZES))]
     ops.append(Op("DML", "scalar_insert_zeroblob",
-                  f"INSERT INTO {t}(id, fn, r_blob, r_any) VALUES "
-                  f"({n + 1}, 'zeroblob_lit', zeroblob({zsize}), length(zeroblob({zsize})));"))
+                  f"INSERT INTO {t}(id, fn, r_any, r_blobtext) VALUES "
+                  f"({n + 1}, 'zeroblob_lit', length(zeroblob({zsize})), zeroblob({zsize}));"))
     # Reopen forces the stored values through the on-disk persistence path (the reload boundary).
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
-    # Read the PERSISTED values back. quote() the blob column so a raw-blob projection is not
-    # transport-ambiguous over `-m list` (a blob's raw bytes are lossy on stdout); the untyped
-    # r_any column is projected bare (its values are ints/text/reals, transport-safe) and via
-    # length()/typeof() so a value-level or type-level persisted divergence surfaces.
+    # Read the PERSISTED values back: r_any bare (+ typeof/length so a type- or value-level
+    # persisted divergence surfaces), r_blobtext via quote() (genuine blob/text -> transport-safe).
     ops.append(Op("QUERY", "scalar_readback",
-                 f"SELECT id, fn, quote(r_blob), typeof(r_any), length(r_any), r_any "
+                 f"SELECT id, fn, typeof(r_any), length(r_any), r_any, quote(r_blobtext) "
                  f"FROM {t} ORDER BY id;"))
     return ops
 
