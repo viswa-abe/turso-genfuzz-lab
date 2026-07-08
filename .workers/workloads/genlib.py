@@ -425,8 +425,13 @@ def _gen_lifecycle(rng: random.Random, plug: tuple[str, ...]) -> list[Op]:
         return [Op("LIFECYCLE", "integrity_check", "PRAGMA integrity_check;")]
     if kind == "reopen":
         return [Op("LIFECYCLE", "reopen", "-- reopen --")]  # handled by runner boundary
-    # Product-pluggable lifecycle op (e.g. checkpoint / attach); rendered as-is.
-    return [Op("LIFECYCLE", kind, kind)]
+    # Product-pluggable lifecycle op (e.g. checkpoint); rendered as-is. A checkpoint PRAGMA
+    # ECHOES a (busy, log, checkpointed) triple that legitimately differs across engines
+    # (sqlite3 emits -1,-1 outside WAL; tursodb emits 0,0), so checkpoint echoes are marked
+    # non-comparable -- a maintenance echo, not a query result under test. quick_check stays
+    # comparable (it is a health oracle like integrity_check).
+    comparable = "checkpoint" not in kind.lower()
+    return [Op("LIFECYCLE", kind, kind, ref_comparable=comparable)]
 
 
 def _gen_expect_error(rng: random.Random, tables: list[dict]) -> list[Op]:
@@ -604,7 +609,7 @@ def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
         read_ok_after_drop = False
     else:
         read_ok_after_drop = True
-    ops.append(Op("LIFECYCLE", "attach_checkpoint", "PRAGMA wal_checkpoint(TRUNCATE);"))
+    ops.append(Op("LIFECYCLE", "attach_checkpoint", "PRAGMA wal_checkpoint(TRUNCATE);", ref_comparable=False))
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     # After reopen the ATTACH is gone (reopen is a fresh connection); re-attach to read.
     ops.append(Op("LIFECYCLE", "attach", f"ATTACH '@@AUX_DB:{alias}@@' AS {alias};"))
@@ -769,6 +774,11 @@ def normalize_value(value: Any, cli_text: bool = False) -> str:
     transport, not a product-behavior suppression. It applies symmetrically and never
     hides a value difference, only the type tag the transport physically cannot carry."""
     # CLI cells arrive already in the CLI's text projection; never re-guess their type.
+    # (We deliberately do NOT collapse integral-float text like "0.0" here: a CLI cell of
+    # "0.0" can be a genuine TEXT result -- e.g. lower(0.0) -> '0.0' -- and collapsing it to
+    # "0" would mask a real text difference. A candidate rendering an empty aggregate as
+    # "0.0" where the reference yields typed 0 is left as a real differential for the
+    # orchestrator to adjudicate, not silently normalized away.)
     if isinstance(value, _CliText):
         return str.__str__(value)
     if value is None:
@@ -814,6 +824,18 @@ class Sqlite3Runner(Runner):
         self.run_dir = run_dir
         self.name = tag
 
+    @staticmethod
+    def _connect(db_path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(db_path, isolation_level=None)
+        # Decode-tolerant text factory: some queries (e.g. group_concat over a column that
+        # ended up holding non-UTF8 bytes) produce a result Python's default TEXT decoder
+        # cannot decode, raising OperationalError -- a REFERENCE-SIDE fragility, not a Turso
+        # defect. Replace undecodable bytes so the reference returns a value (comparable to
+        # the CLI's own rendering) rather than spuriously "rejecting" a statement the CLI
+        # accepts. Bytes that are valid UTF-8 decode unchanged, so normal text is unaffected.
+        conn.text_factory = lambda b: b.decode("utf-8", "replace")
+        return conn
+
     def _aux_path(self, seed: int, alias: str) -> str:
         return str(self.run_dir / f"{self.name}-{seed}-{alias}.auxdb")
 
@@ -828,18 +850,18 @@ class Sqlite3Runner(Runner):
         for aux in self.run_dir.glob(f"{self.name}-{program.seed}-*.auxdb"):
             aux.unlink(missing_ok=True)
         result = RunResult()
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn = self._connect(str(db_path))
         try:
             for op in program.ops:
                 if op.kind == "reopen":
                     conn.close()
-                    conn = sqlite3.connect(str(db_path), isolation_level=None)
+                    conn = self._connect(str(db_path))
                     continue
                 self._exec_one(conn, op, result, program.seed)
             # terminal reopen probe
             conn.close()
             try:
-                conn = sqlite3.connect(str(db_path), isolation_level=None)
+                conn = self._connect(str(db_path))
                 conn.execute("PRAGMA integrity_check;").fetchall()
                 result.reopened_ok = True
             except sqlite3.Error:
