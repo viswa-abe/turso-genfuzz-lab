@@ -1,0 +1,6 @@
+.workers/tmp/
+.workers/vendor/
+.workers/builds/
+.workers/workloads/__pycache__/
+**/__pycache__/
+*.pyc

@@ -1,0 +1,3 @@
+# turso-genfuzz-lab
+
+A seeded generator + differential harness lab for tursodb `v0.7.0-pre.10` (asset `turso_cli-x86_64-unknown-linux-gnu.tar.xz`, sha256 `7953bcfb301b3cdd2c8032a7813e2af17b7aa9e917c80b300e861b03a8173ba9`): each integer seed deterministically produces a SQL program (config axes swept as data + generic op/feature families — DDL/DML/QUERY/lifecycle, FTS, JSON table-valued functions, triggers, ATTACH), which is run against both stdlib `sqlite3` (reference) and the vendored `tursodb` CLI (candidate) and compared by universal, product-independent oracles (panic/abort, integrity, terminal-state, reopen-persistence, differential rows, differential error-class); families the reference cannot express identically (FTS) fall back to the universal oracles only.
