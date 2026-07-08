@@ -70,6 +70,87 @@ CORE_AXES: dict[str, tuple] = {
     "encryption": (0, 1),
 }
 
+# ---------------------------------------------------------------------------
+# Known-class quarantines (EXP-109 lever 1a) -- visible, never silent
+# ---------------------------------------------------------------------------
+#
+# A confirmed crashing config family MASKS the rest of a program: the candidate panics
+# mid-run and every op after the panic is lost, so no OTHER oracle on that program can fire.
+# WP-025 is exactly this -- encryption=1 with a non-4096 page_size aborts the tursodb process
+# (assertion "Page data must be exactly 4096 bytes" at core/storage/encryption.rs:742). Left
+# unmanaged it killed ~44% of cases (EXP-106: 66/150 encryption-panic), starving the four
+# outstanding differential matchers (WP-002/005/008/015/023) of programs that run to the end.
+#
+# The fix is a DECLARED quarantine, not a silent skip: a predicate over the config identifies
+# the known-crash family; a quarantined config is DOWNWEIGHTED to a small canary fraction
+# (enough runs to keep the WP-025 panic matcher alive) and re-rolled to a non-quarantined
+# config otherwise. Every skip/downweight emits a `SUPPRESSED <rule> <reason>` line so the
+# quarantine is auditable -- it is management of a KNOWN finding, never suppression of an
+# unknown one. Generic: a predicate over swept axis values + a canary rate, both data.
+@dataclass(frozen=True)
+class ConfigQuarantine:
+    rule: str                              # short id emitted in the SUPPRESSED line
+    predicate: Callable[[dict], bool]      # True if this config is in the known-crash family
+    reason: str                            # human reason (cited to the confirmed finding)
+    reference: str                         # the confirmed finding this quarantines
+    canary_rate: float                     # fraction of quarantined draws kept (matcher alive)
+
+
+CONFIG_QUARANTINES: tuple[ConfigQuarantine, ...] = (
+    ConfigQuarantine(
+        rule="wp025-enc-nonstd-pagesize",
+        predicate=lambda c: bool(c.get("encryption")) and c.get("page_size") != 4096,
+        reason="encryption=1 with page_size!=4096 aborts tursodb "
+               "(assert 'Page data must be exactly 4096 bytes', encryption.rs:742); "
+               "the abort truncates the program and masks every later oracle",
+        reference="WP-025 / turso #7610",
+        canary_rate=0.05,   # ~5% of would-be-quarantined draws kept, to keep the panic matcher alive
+    ),
+)
+
+
+def match_config_quarantine(config: dict) -> Optional[ConfigQuarantine]:
+    """Return the first quarantine whose predicate matches this config, else None."""
+    for q in CONFIG_QUARANTINES:
+        if q.predicate(config):
+            return q
+    return None
+
+
+# Known-integrity-signature allowlist (EXP-109 lever 1b) -- the confirmed WP-024 FTS
+# integrity message. The integrity oracle CONTINUES the case on a match (emitting a SUPPRESSED
+# line) AND keeps checking every OTHER integrity message: a non-matching integrity failure
+# still reds. Left un-allowlisted, the WP-024 signature fired on essentially every FTS-bearing
+# program (EXP-106: 84/150) and drowned out attach/pager integrity failures (WP-008 lives
+# there). The allowlist is DATA (signature regex + finding ref); suppression is always emitted.
+@dataclass(frozen=True)
+class IntegritySignature:
+    rule: str            # short id emitted in the SUPPRESSED line
+    pattern: str         # regex tested against an integrity_check message line
+    reason: str
+    reference: str
+
+
+KNOWN_INTEGRITY_SIGNATURES: tuple[IntegritySignature, ...] = (
+    IntegritySignature(
+        rule="known-fts-integrity",
+        # The confirmed WP-024 message: integrity_check reports a wrong entry count for the
+        # internal FTS directory index. The index name varies per table, so match the stable
+        # prefix, not a pinned name.
+        pattern=r"wrong # of entries in index __turso_internal_fts",
+        reason="confirmed FTS-index integrity_check miscount after valid FTS inserts",
+        reference="WP-024 / turso #7611",
+    ),
+)
+
+
+def match_integrity_signature(message: str) -> Optional[IntegritySignature]:
+    for s in KNOWN_INTEGRITY_SIGNATURES:
+        if re.search(s.pattern, message):
+            return s
+    return None
+
+
 # Boundary literal pool -- the values scalar functions and DML are stressed over.
 # Declared once, as data, so an auditor sees the boundary space is swept.
 BOUNDARY_VALUES: tuple[Any, ...] = (
@@ -118,9 +199,28 @@ BOUNDARY_VALUES: tuple[Any, ...] = (
 # tursodb's 17-digit REAL rendering into false reds. Reintroducing it needs a transport-safe
 # aggregate projection design first -- recorded as follow-up, not silently dropped.
 
-# Identifier styles for DDL -- plain, quoted, keyword-ish, unicode. Data-driven so
-# the generator exercises the identifier grammar rather than one safe style.
-IDENTIFIER_STYLES: tuple[str, ...] = ("plain", "quoted", "keywordish", "unicode", "spaced")
+# Identifier styles for DDL -- a GENERIC sweep of the SQLite identifier-quoting grammar
+# (EXP-109 lever 2). Every DDL object (tables, columns, indexes, views, triggers) draws a
+# style from this pool, so the generator exercises the whole quoting surface rather than one
+# safe style. WP-005 (quoted trigger schema-reload mismatch) is ONE inhabitant of this family,
+# not a pinned constant -- the axis sweeps bare / "double-quoted" / [bracketed] / `backticked` /
+# mixed-CASE / reserved-adjacent / space- and dot-containing quoted names, and the durability
+# read-back tail (lever 3) re-projects every object AFTER a reopen so the schema-reload path is
+# the comparison point. `render_identifier` maps each style to valid SQL both engines parse.
+#   plain        -- bare lowercase identifier (no quoting)
+#   quoted       -- "double-quoted" (SQL-standard delimited identifier)
+#   bracketed    -- [bracketed] (SQLite/T-SQL delimited identifier)
+#   backticked   -- `backticked` (MySQL-compat delimited identifier SQLite also accepts)
+#   keywordish   -- a reserved-word-adjacent name, double-quoted so it stays legal
+#   mixedcase    -- MixedCase bare identifier (case-folding / case-preservation on reload)
+#   unicode      -- non-ASCII delimited identifier ("...é☃")
+#   spaced       -- a space-containing delimited identifier ("... col")
+#   dotted       -- a dot-containing delimited identifier ("a.b") -- the quoted-dot name that
+#                   must NOT be parsed as schema.table (a classic quoting-reload hazard)
+IDENTIFIER_STYLES: tuple[str, ...] = (
+    "plain", "quoted", "bracketed", "backticked", "keywordish",
+    "mixedcase", "unicode", "spaced", "dotted",
+)
 
 # Scalar functions shared by SQLite and Turso, called over the boundary pool.
 SCALAR_FUNCS: tuple[str, ...] = (
@@ -172,6 +272,17 @@ class FeatureFamily:
     name: str
     ref_comparable: bool
     weight: int
+    # EXP-109 lever 1c -- FEATURE-FAMILY SUBSET MASK. Each program draws an independent
+    # per-family inclusion decision from a seed-derived rng: the family is included in that
+    # program with probability `include_prob`, else it is masked OUT entirely (no ops of that
+    # family are generated, and the coverage guarantee does not force it in). This is what
+    # makes a real fraction of programs contain NO FTS at all -- which UNMASKS the universal
+    # integrity oracle for attach/pager corruption (WP-008), since the confirmed WP-024 FTS
+    # signature no longer fires on every program's integrity tail and drown out other integrity
+    # failures. Generic: an independent Bernoulli inclusion per family, probability declared as
+    # data. FTS gets the lowest inclusion so FTS-free programs are common; the comparable
+    # families stay high so their differentials still run most of the time.
+    include_prob: float = 1.0
 
 
 FEATURE_FAMILIES: tuple[FeatureFamily, ...] = (
@@ -179,17 +290,23 @@ FEATURE_FAMILIES: tuple[FeatureFamily, ...] = (
     # `fts_match(cols, term)` / `col MATCH term` predicate. The reference (sqlite3) only
     # has fts5's `CREATE VIRTUAL TABLE ... USING fts5` + `MATCH` -- different DDL and no
     # `fts_match` scalar -- so it is NOT reference-comparable; universal oracles only.
-    FeatureFamily("fts", ref_comparable=False, weight=2),
+    # include_prob=0.5: HALF of programs are FTS-free, so the WP-024 integrity signature does
+    # not blanket every program and mask non-FTS (attach/pager) integrity failures (WP-008).
+    FeatureFamily("fts", ref_comparable=False, weight=2, include_prob=0.5),
     # JSON TVF: json_each / json_tree as table-valued functions in joins / correlated
     # subqueries / CTE reuse. Python's sqlite3 ships JSON1 with identical syntax, so this
-    # family IS reference-comparable (full differential).
-    FeatureFamily("json_tvf", ref_comparable=True, weight=2),
+    # family IS reference-comparable (full differential). Kept common (comparable + WP-023).
+    FeatureFamily("json_tvf", ref_comparable=True, weight=2, include_prob=0.85),
     # Triggers exercised THROUGH a reopen boundary (create trigger, reopen db, then fire
     # it) with the shared identifier-style pool. Both engines have triggers -> comparable.
-    FeatureFamily("trigger", ref_comparable=True, weight=1),
+    FeatureFamily("trigger", ref_comparable=True, weight=1, include_prob=0.85),
     # Attached auxiliary databases: ATTACH + DDL/DROP in aux + checkpoint/reopen. Standard
-    # SQL both engines share -> comparable (row set + accept/reject).
-    FeatureFamily("attach", ref_comparable=True, weight=1),
+    # SQL both engines share -> comparable (row set + accept/reject). Kept high: WP-008 lives
+    # here and its integrity failure is only visible when FTS is NOT masking the tail.
+    FeatureFamily("attach", ref_comparable=True, weight=1, include_prob=0.85),
+    # Scalar-function boundary persisted read-back (EXP-109 lever 3): persist scalar results
+    # over swept boundary values, reopen, read back -- WP-015 lives here. Fully comparable.
+    FeatureFamily("scalar_persist", ref_comparable=True, weight=2, include_prob=0.85),
 )
 
 FEATURE_FAMILY_NAMES: tuple[str, ...] = tuple(f.name for f in FEATURE_FAMILIES)
@@ -299,22 +416,38 @@ def render_literal(value: Any) -> str:
 
 
 _KEYWORDS = ("select", "table", "order", "group", "index", "where", "from")
+# Reserved words used bare-adjacent by the keywordish style (double-quoted so legal).
+_RESERVED_ADJ = ("order", "group", "index", "table", "where", "select", "having", "join")
 
 
 def render_identifier(base: str, style: str) -> str:
-    """Render a table/column identifier in the given style, always double-quoted
-    when the style requires it so the SQL stays valid across engines."""
+    """Render a table/column identifier in the given style. Delimited styles are quoted so
+    the SQL stays valid across engines; each engine must resolve the SAME quoted name to the
+    SAME object after a schema reload (the WP-005 quoting-reload contract). Generic: a style
+    pool swept as data, no target-specific identifier pinned."""
     if style == "plain":
         return base
+    if style == "mixedcase":
+        # Bare identifier with mixed case -- exercises case-folding on reload (SQLite folds
+        # unquoted identifiers to a case-insensitive match; both engines must agree).
+        return base[:1].upper() + base[1:] + "X"
     if style == "quoted":
         return '"' + base + '"'
+    if style == "bracketed":
+        return "[" + base + "]"
+    if style == "backticked":
+        return "`" + base + "`"
     if style == "keywordish":
-        kw = _KEYWORDS[len(base) % len(_KEYWORDS)]
+        kw = _RESERVED_ADJ[len(base) % len(_RESERVED_ADJ)]
         return '"' + kw + "_" + base + '"'
     if style == "unicode":
         return '"' + base + "_é☃" + '"'
     if style == "spaced":
         return '"' + base + " col" + '"'
+    if style == "dotted":
+        # A quoted DOT-containing name -- must be treated as one identifier, NOT schema.table.
+        # The reload path is where an engine that mis-splits this diverges.
+        return '"' + base + ".d" + '"'
     return base
 
 
@@ -322,15 +455,94 @@ def render_identifier(base: str, style: str) -> str:
 # Generator
 # ---------------------------------------------------------------------------
 
-def choose_config(root: int, axes: dict[str, tuple]) -> dict[str, Any]:
+# SUPPRESSED-line sink. Every quarantine/allowlist action appends one line here AND (when
+# emit is on) prints it, so a sweep's stdout carries a visible, greppable audit trail of every
+# known-class management action. A test can read the buffer without capturing stdout.
+_SUPPRESSED_LOG: list[str] = []
+
+
+def emit_suppressed(rule: str, detail: str, emit: bool = True) -> None:
+    """Record (and optionally print) a `SUPPRESSED <rule> <detail>` line. This is the
+    never-silent half of the quarantine contract: a known-class skip/downweight/allowlist is
+    ALWAYS surfaced, never dropped."""
+    line = f"SUPPRESSED {rule} {detail}"
+    _SUPPRESSED_LOG.append(line)
+    if emit:
+        print(line, flush=True)
+
+
+def choose_config(root: int, axes: dict[str, tuple], emit_suppress: bool = False) -> dict[str, Any]:
     """Pick one value per axis. Iterate axis names in sorted order so the result is
-    independent of dict insertion order across processes."""
+    independent of dict insertion order across processes.
+
+    EXP-109 lever 1a -- KNOWN-CRASH CONFIG QUARANTINE. After the raw draw, if the config falls
+    in a declared known-crash family (CONFIG_QUARANTINES), it is kept only as a small canary
+    fraction (canary_rate) -- otherwise it is RE-ROLLED to a non-quarantined config drawn from
+    the same axes. The canary keep/drop and the re-roll are both seed-derived (a dedicated
+    'config-quarantine' rng stream), so the whole decision stays a pure function of the seed
+    and is byte-reproducible across processes. Every keep and every re-roll emits a SUPPRESSED
+    line, so the quarantine is auditable. This is management of a CONFIRMED finding (WP-025),
+    never suppression of an unknown one: the panic matcher still fires on the canary fraction."""
     rng = seeded_rng(root, "config")
     config: dict[str, Any] = {}
     for name in sorted(axes):
         values = axes[name]
         config[name] = values[rng.randrange(len(values))]
+
+    q = match_config_quarantine(config)
+    if q is not None:
+        qrng = seeded_rng(root, "config-quarantine")
+        if qrng.random() < q.canary_rate:
+            # Keep as a canary -- the WP-025 panic matcher stays alive on this small fraction.
+            emit_suppressed(
+                q.rule,
+                f"canary-kept config={_config_brief(config)} reason={q.reason!r} ref={q.reference}",
+                emit_suppress,
+            )
+        else:
+            # Re-roll to a NON-quarantined config so the rest of the program runs to the end
+            # (unmasking the differential matchers). Bounded re-rolls; if every re-roll is
+            # still quarantined (cannot happen with the current single predicate, but kept
+            # generic), force page_size to the safe 4096 as a last resort.
+            original = dict(config)
+            for _ in range(8):
+                for name in sorted(axes):
+                    config[name] = axes[name][qrng.randrange(len(axes[name]))]
+                if match_config_quarantine(config) is None:
+                    break
+            else:
+                config["page_size"] = 4096
+            emit_suppressed(
+                q.rule,
+                f"downweighted config={_config_brief(original)} -> {_config_brief(config)} "
+                f"reason={q.reason!r} ref={q.reference}",
+                emit_suppress,
+            )
     return config
+
+
+def _config_brief(config: dict) -> str:
+    """A compact key config summary for SUPPRESSED lines (the axes that matter to quarantines)."""
+    return f"enc={config.get('encryption')},ps={config.get('page_size')}"
+
+
+def feature_mask(root: int, families: tuple[str, ...]) -> tuple[str, ...]:
+    """EXP-109 lever 1c -- per-program feature-family inclusion mask. Each enabled family is
+    independently included with its declared `include_prob`, drawn from a seed-derived
+    'feature-mask' rng so the mask is a pure function of the seed. Returns the subset of
+    `families` included in THIS program; a masked-out family contributes no ops and is not
+    forced in by the coverage guarantee. This is what makes a real fraction of programs
+    FTS-free (unmasking the integrity oracle for non-FTS corruption, WP-008)."""
+    rng = seeded_rng(root, "feature-mask")
+    included: list[str] = []
+    for name in families:
+        fam = _FEATURE_BY_NAME.get(name)
+        prob = fam.include_prob if fam is not None else 1.0
+        # Draw for every family in declared order (stable) so the stream stays seed-stable
+        # regardless of which are ultimately kept.
+        if rng.random() < prob:
+            included.append(name)
+    return tuple(included)
 
 
 def _pool_value(rng: random.Random) -> Any:
@@ -726,6 +938,82 @@ def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
     return ops
 
 
+# Scalar functions whose RESULT is persisted to a table then read back after reopen
+# (EXP-109 lever 3). A generic sweep of the scalar-function grammar over the boundary pool;
+# WP-015 (zeroblob / numeric-prefix persisted-value divergence) is ONE inhabitant, not pinned.
+# Rendered by `_render_scalar_persist` so each takes a swept boundary value as its argument.
+SCALAR_PERSIST_FUNCS: tuple[str, ...] = (
+    "zeroblob", "hex", "quote", "cast_int", "cast_real", "cast_text", "abs", "round2",
+    "length", "substr3", "replace3", "typeof", "upper", "trim",
+)
+
+
+def _render_scalar_persist(fn: str, val: str) -> str:
+    """Render a scalar-function call over one boundary literal `val` -- the value whose
+    persisted round-trip is under test. Generic grammar sweep, no target tuple."""
+    if fn == "zeroblob":
+        # zeroblob wants an int size; drive it over a swept small-int size pool via abs()
+        # of the value so it stays a valid size, and also cover the literal sizes 0/1/4096.
+        return f"zeroblob(abs(round({val})) % 4097)"
+    if fn == "cast_int":
+        return f"CAST({val} AS INTEGER)"
+    if fn == "cast_real":
+        return f"CAST({val} AS REAL)"
+    if fn == "cast_text":
+        return f"CAST({val} AS TEXT)"
+    if fn == "round2":
+        return f"round({val}, 2)"
+    if fn == "substr3":
+        return f"substr({val}, 1, 3)"
+    if fn == "replace3":
+        return f"replace({val}, 'a', 'Z')"
+    return f"{fn}({val})"
+
+
+# Explicit zeroblob sizes to cover the boundary sizes 0 / 1 / 4096 the census calls out.
+ZEROBLOB_SIZES: tuple[int, ...] = (0, 1, 4096)
+
+
+def _gen_scalar_persist(rng: random.Random) -> list[Op]:
+    """EXP-109 lever 3 -- SCALAR-FUNCTION BOUNDARY PERSISTED READ-BACK. Build a table, INSERT
+    rows whose columns are scalar-function calls over swept boundary values (incl. numeric-
+    prefix strings, overflow ints, zeroblob sizes 0/1/4096), then REOPEN and read the stored
+    values back. The differential is on the PERSISTED value after a reload -- exactly the
+    WP-015 divergence a bare SELECT would miss because it never hits the on-disk path. Fully
+    reference-comparable (both engines share these scalars). Generic: a swept scalar grammar
+    over the boundary pool, no pinned constant."""
+    ops: list[Op] = []
+    t = _fresh_name(rng, "scal")
+    ops.append(Op("DDL", "scalar_create_table",
+                  f"CREATE TABLE {t}(id INTEGER PRIMARY KEY, fn TEXT, r_blob BLOB, r_any);"))
+    n = rng.randint(3, 6)
+    rows = []
+    for i in range(n):
+        fn = SCALAR_PERSIST_FUNCS[rng.randrange(len(SCALAR_PERSIST_FUNCS))]
+        val = render_literal(_pool_value(rng))
+        expr = _render_scalar_persist(fn, val)
+        # Store the scalar result twice: once forced through a BLOB column, once through an
+        # untyped column, so both affinity paths persist and read back.
+        rows.append(f"({i + 1}, {sql_quote_str(fn)}, {expr}, {expr})")
+    ops.append(Op("DML", "scalar_insert",
+                  f"INSERT INTO {t}(id, fn, r_blob, r_any) VALUES {', '.join(rows)};"))
+    # Also persist the explicit zeroblob boundary sizes (0/1/4096) the census names.
+    zsize = ZEROBLOB_SIZES[rng.randrange(len(ZEROBLOB_SIZES))]
+    ops.append(Op("DML", "scalar_insert_zeroblob",
+                  f"INSERT INTO {t}(id, fn, r_blob, r_any) VALUES "
+                  f"({n + 1}, 'zeroblob_lit', zeroblob({zsize}), length(zeroblob({zsize})));"))
+    # Reopen forces the stored values through the on-disk persistence path (the reload boundary).
+    ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
+    # Read the PERSISTED values back. quote() the blob column so a raw-blob projection is not
+    # transport-ambiguous over `-m list` (a blob's raw bytes are lossy on stdout); the untyped
+    # r_any column is projected bare (its values are ints/text/reals, transport-safe) and via
+    # length()/typeof() so a value-level or type-level persisted divergence surfaces.
+    ops.append(Op("QUERY", "scalar_readback",
+                 f"SELECT id, fn, quote(r_blob), typeof(r_any), length(r_any), r_any "
+                 f"FROM {t} ORDER BY id;"))
+    return ops
+
+
 def _gen_feature(rng: random.Random, families: tuple[str, ...], run_ctx: dict) -> list[Op]:
     """Pick one enabled feature family (weighted) and emit its op sequence."""
     enabled = [f for f in FEATURE_FAMILIES if f.name in families]
@@ -749,15 +1037,24 @@ def _gen_feature(rng: random.Random, families: tuple[str, ...], run_ctx: dict) -
         return _gen_trigger(rng)
     if chosen.name == "attach":
         return _gen_attach(rng, run_ctx)
+    if chosen.name == "scalar_persist":
+        return _gen_scalar_persist(rng)
     return []
 
 
 def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] = (),
-             feature_families: tuple[str, ...] = FEATURE_FAMILY_NAMES) -> Program:
+             feature_families: tuple[str, ...] = FEATURE_FAMILY_NAMES,
+             emit_suppress: bool = False) -> Program:
     """Produce a Program fully determined by seed. axes is CORE_AXES merged with any
-    product axes. lifecycle_plug adds product lifecycle op kinds (e.g. checkpoint)."""
+    product axes. lifecycle_plug adds product lifecycle op kinds (e.g. checkpoint).
+    emit_suppress prints the config-quarantine SUPPRESSED lines (on during a real sweep)."""
     root = seed  # seed is already a root int
-    config = choose_config(root, axes)
+    config = choose_config(root, axes, emit_suppress=emit_suppress)
+    # EXP-109 lever 1c -- restrict this program's feature families to the seed-derived inclusion
+    # mask, so a real fraction of programs are FTS-free (unmasking non-FTS integrity failures).
+    # The mask is a pure function of the seed; the coverage guarantee below only forces in
+    # families that survived the mask, never a masked-out one.
+    active_families = feature_mask(root, feature_families)
     rng = seeded_rng(root, "ops")
     tables: list[dict] = []
     ops: list[Op] = []
@@ -791,7 +1088,7 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
         elif pick < 0.55:
             ops.extend(_gen_query(rng, tables))
         elif pick < 0.70:
-            ops.extend(_gen_feature(rng, feature_families, run_ctx))
+            ops.extend(_gen_feature(rng, active_families, run_ctx))
         elif pick < 0.85:
             ops.extend(_gen_lifecycle(rng, lifecycle_plug))
         else:
@@ -812,8 +1109,12 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
         "json_tvf": "json_insert",
         "trigger": "trigger_create",
         "attach": "attach_create",
+        "scalar_persist": "scalar_create_table",
     }
-    for fam in feature_families:
+    # Force in ONLY families that survived this program's inclusion mask (active_families) --
+    # a masked-out family (e.g. FTS in an FTS-free program) is deliberately absent and must NOT
+    # be forced back in, or the mask would be a no-op and the integrity tail never unmask.
+    for fam in active_families:
         if fam in _FEATURE_BY_NAME and _feature_marker.get(fam) not in present_kinds:
             if fam == "fts":
                 ops.extend(_gen_fts(rng))
@@ -823,6 +1124,8 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
                 ops.extend(_gen_trigger(rng))
             elif fam == "attach":
                 ops.extend(_gen_attach(rng, run_ctx))
+            elif fam == "scalar_persist":
+                ops.extend(_gen_scalar_persist(rng))
             present_kinds = {op.kind for op in ops}
 
     # EXP-106 lever 3 -- GENERIC DURABILITY READ-BACK TAIL. Every program ends with a reopen
@@ -881,6 +1184,12 @@ class RunResult:
     reopened_ok: bool = True      # db reopenable after run
     integrity_ok: Optional[bool] = None  # last integrity_check verdict, if run
     page_size_readback: str = ""  # PRAGMA page_size read back post-run (config-realized proof)
+    # Every non-"ok" line reported by ANY integrity_check/quick_check run during the program.
+    # The integrity oracle consults the KNOWN_INTEGRITY_SIGNATURES allowlist against these
+    # messages (EXP-109 lever 1b): a known-signature line is SUPPRESSED (emitted) and the case
+    # continues; any OTHER non-ok line still reds. Captured on the CANDIDATE side (the engine
+    # under test); the reference never reports non-ok.
+    integrity_messages: list[str] = field(default_factory=list)
 
 
 class Runner:
@@ -1143,6 +1452,11 @@ class Sqlite3Runner(Runner):
             result.stmts.append(StmtResult(sql, 0, [tuple(r) for r in rows], "", op.ref_comparable))
             if op.kind in ("integrity_check", "fts_integrity", "attach_integrity"):
                 result.integrity_ok = bool(rows) and str(rows[0][0]).lower() == "ok"
+                # Record every non-"ok" line so the oracle can allowlist-classify each message.
+                for r in rows:
+                    msg = str(r[0]) if r else ""
+                    if msg.lower() != "ok":
+                        result.integrity_messages.append(msg)
         except sqlite3.Error as exc:
             result.stmts.append(StmtResult(sql, 1, [], f"{type(exc).__name__}: {exc}", op.ref_comparable))
 
@@ -1308,6 +1622,11 @@ class CliRunner(Runner):
                 attach_preamble.append(stmt_sql)
             if op.kind in ("integrity_check", "fts_integrity", "attach_integrity") and rc == 0:
                 result.integrity_ok = any(r and str(r[0]).lower() == "ok" for r in rows)
+                # Record every non-"ok" line for allowlist classification (EXP-109 lever 1b).
+                for r in rows:
+                    msg = str(r[0]) if r else ""
+                    if msg.lower() != "ok":
+                        result.integrity_messages.append(msg)
         # verify_config: read page_size back after a run so a sweep can SEE the config took
         # effect (ref_comparable=False -- recorded, not differentially compared). This is the
         # cheap generic probe that the swept page_size actually bound under this config.
@@ -1512,11 +1831,37 @@ def oracle_reopen(ref: RunResult, cand: RunResult) -> Finding:
     return Finding("reopen_persistence", ok, f"reopened_ok={cand.reopened_ok}")
 
 
-def oracle_integrity(ref: RunResult, cand: RunResult) -> Finding:
-    """If the candidate ran an integrity_check, it must report ok."""
+def oracle_integrity(ref: RunResult, cand: RunResult, emit: bool = False) -> Finding:
+    """If the candidate ran an integrity_check, it must report ok -- UNLESS every non-ok line
+    matches a known-signature allowlist entry (EXP-109 lever 1b). Classification is per
+    message: a known signature (e.g. the confirmed WP-024 FTS miscount) is SUPPRESSED (emitted
+    as a SUPPRESSED line) and the case continues; ANY line that does not match a known
+    signature still reds. So the allowlist only mutes the CONFIRMED FTS finding while keeping
+    integrity live for every OTHER corruption (attach/pager -- WP-008)."""
     if cand.integrity_ok is None:
         return Finding("integrity", True, "no_integrity_check_run")
-    return Finding("integrity", cand.integrity_ok, f"integrity_ok={cand.integrity_ok}")
+    if cand.integrity_ok:
+        return Finding("integrity", True, "integrity_ok=True")
+    # Candidate reported non-ok. Classify each recorded message.
+    messages = cand.integrity_messages or ["<non-ok, no message captured>"]
+    unknown: list[str] = []
+    suppressed_rules: set[str] = set()
+    for msg in messages:
+        sig = match_integrity_signature(msg)
+        if sig is not None:
+            suppressed_rules.add(sig.rule)
+            emit_suppressed(sig.rule, f"{msg!r} ref={sig.reference}", emit)
+        else:
+            unknown.append(msg)
+    if unknown:
+        # A non-allowlisted integrity failure -- a real red (e.g. attach/pager corruption).
+        return Finding("integrity", False,
+                       f"integrity_ok=False unknown_messages={unknown[:3]!r} "
+                       f"suppressed={sorted(suppressed_rules)}")
+    # Every non-ok line was a known confirmed signature -> case continues (GREEN for this
+    # oracle), but the suppression is on record (SUPPRESSED lines above + the note here).
+    div_id = ",".join(sorted(suppressed_rules))
+    return Finding("integrity", True, f"all-non-ok-allowlisted={sorted(suppressed_rules)}", div_id)
 
 
 def oracle_error_class(ref: RunResult, cand: RunResult) -> Finding:
@@ -1621,7 +1966,7 @@ def run_case(
     Verdict: RED if any oracle fails; VOID if the harness itself errored; else GREEN.
     """
     reference, candidate = runners
-    program = generate(seed, axes, lifecycle_plug)
+    program = generate(seed, axes, lifecycle_plug, emit_suppress=emit)
     findings: list[Finding] = []
     verdict = "GREEN"
     exit_code = 0
@@ -1635,6 +1980,8 @@ def run_case(
         for oracle in ORACLES:
             if oracle is oracle_diff_rows:
                 f = oracle(ref_result, cand_result, cli_text)
+            elif oracle is oracle_integrity:
+                f = oracle(ref_result, cand_result, emit)
             else:
                 f = oracle(ref_result, cand_result)
             findings.append(f)
