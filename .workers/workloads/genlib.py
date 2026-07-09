@@ -964,8 +964,6 @@ SCALAR_PERSIST_NUMERIC_FUNCS: tuple[str, ...] = (
 SCALAR_PERSIST_TEXT_FUNCS: tuple[str, ...] = (
     "cast_text", "substr3", "replace3", "upper", "trim",
 )
-# Back-compat alias (some probes reference the union); the two pools together are the sweep.
-SCALAR_PERSIST_FUNCS: tuple[str, ...] = SCALAR_PERSIST_NUMERIC_FUNCS + SCALAR_PERSIST_TEXT_FUNCS
 
 
 def _render_scalar_persist(fn: str, val: str) -> str:
@@ -2003,7 +2001,11 @@ def oracle_diff_rows(ref: RunResult, cand: RunResult, cli_text: bool = False, em
             # confirmed WP-024 class the integrity oracle already suppressed. Only suppresses
             # when the reference is a clean `ok` and every candidate non-ok cell is known.
             if _INTEGRITY_SQL_RE.search(c.sql):
-                ref_ok = all(str(cell).lower() == "ok" for row in r.rows for cell in row)
+                # `bool(r.rows) and ...`: the reference must have ACTUALLY produced an `ok`
+                # rowset, not vacuously (an empty reference rowset must NOT license suppression
+                # -- that would silently mask a candidate integrity failure whenever the
+                # reference integrity_check happened to return zero rows). Non-vacuous discipline.
+                ref_ok = bool(r.rows) and all(str(cell).lower() == "ok" for row in r.rows for cell in row)
                 known = _all_cells_known_integrity(c.rows)
                 if ref_ok and known is not None:
                     emit_suppressed(known, f"diff_rows-on-integrity stmt={c.sql!r} "
