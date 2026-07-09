@@ -1025,14 +1025,23 @@ def _gen_trigger(rng: random.Random, dense: bool = False) -> list[Op]:
                   f"CREATE TRIGGER {trg} AFTER INSERT ON {tgt} BEGIN "
                   f"INSERT INTO {audit} VALUES('fired:' || NEW.a || ':' || NEW.b); END;"))
     # UNRELATED schema mutation between CREATE and reopen/fire -- forces a schema reload where the
-    # trigger's (quoted) target name must re-resolve (the WP-005 precondition). Swept kind.
-    mut = ("drop_col", "add_col", "drop_unrelated")[rng.randrange(3)]
-    if mut == "drop_col":
-        ops.append(Op("DDL", "trigger_schema_mutate",
-                      f"ALTER TABLE {other} DROP COLUMN z;"))
-    elif mut == "add_col":
+    # trigger's (quoted) target name must re-resolve (the WP-005 precondition). Swept over ONLY
+    # tursodb-supported DDL so the mutation ACCEPTS on both engines (an unsupported DDL would
+    # accept-mismatch and truncate the program before the re-fire, masking WP-005 -- EXP-111 smoke
+    # found ALTER DROP COLUMN is unsupported by the pin, a near-miss recorded separately). ADD
+    # COLUMN, an unrelated CREATE INDEX, a RENAME, and dropping the unrelated table all reload the
+    # schema and are accepted. Generic: an unrelated schema-change axis, no target name pinned.
+    mut = ("add_col", "add_index", "rename_col", "drop_unrelated")[rng.randrange(4)]
+    if mut == "add_col":
         ops.append(Op("DDL", "trigger_schema_mutate",
                       f"ALTER TABLE {other} ADD COLUMN w TEXT;"))
+    elif mut == "add_index":
+        oidx = render_identifier(f"{base}_oi", style)
+        ops.append(Op("DDL", "trigger_schema_mutate",
+                      f"CREATE INDEX {oidx} ON {other}(x);"))
+    elif mut == "rename_col":
+        ops.append(Op("DDL", "trigger_schema_mutate",
+                      f"ALTER TABLE {other} RENAME COLUMN z TO z2;"))
     else:
         ops.append(Op("DDL", "trigger_schema_mutate",
                       f"DROP TABLE {other};"))
