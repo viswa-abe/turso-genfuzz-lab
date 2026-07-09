@@ -307,6 +307,11 @@ FEATURE_FAMILIES: tuple[FeatureFamily, ...] = (
     # Scalar-function boundary persisted read-back (EXP-109 lever 3): persist scalar results
     # over swept boundary values, reopen, read back -- WP-015 lives here. Fully comparable.
     FeatureFamily("scalar_persist", ref_comparable=True, weight=2, include_prob=0.85),
+    # EXP-111 -- AGGREGATE-OVER-JOIN across populated / empty / all-NULL tables, with the
+    # PLAN-STATE (ANALYZE) axis so both fresh and statistics-perturbed plans are exercised. The
+    # empty-inner aggregate-over-join returns a single null-row group (COUNT=0, other cols NULL);
+    # a divergent engine panics on the null-row cursor path (WP-002). Fully reference-comparable.
+    FeatureFamily("agg_join", ref_comparable=True, weight=2, include_prob=0.85),
 )
 
 FEATURE_FAMILY_NAMES: tuple[str, ...] = tuple(f.name for f in FEATURE_FAMILIES)
@@ -322,13 +327,120 @@ JSON_SHAPES: tuple[str, ...] = (
     '{"a":{"b":1,"c":[2,{"target":"needle"}]},"items":[{"name":"one","v":10}],"z":"last"}',
     '{"items":[{"name":"flat","v":30}],"a":"b","c":"d"}',
     '{"items":[{"name":"array0"},{"nested":{"target":"needle"}},[7,8]],"meta":{"ok":true}}',
+    # Docs carrying dotted / spaced / unicode keys so the swept path-pool segments (dotted,
+    # spaced, unicode) actually RESOLVE to root rows -- the WP-023 quoted-two-arg-path shape.
     '{"a.b":{"space key":9,"arr":[{"b":11},{"target":"needle"}]},"items":[]}',
+    '{"x.y":{"nested":1},"café":{"v":2},"arr":[10,20,30],"items":[{"v":3}]}',
+    '{"a b c":{"k":1},"ключ":[1,2],"a":{"b":{"c":9}},"items":[{"v":4}]}',
     '{"scalar":42,"items":[1,2,3],"tail":{"b":12}}',
     '{"items":[],"empty":{},"a":{"c":[]},"target":"top"}',
 )
 
-# JSON path arguments (second arg to json_tree/json_each) -- includes quoted-key paths.
-JSON_PATHS: tuple[str, ...] = ("$", "$.a", "$.items", '$."a.b"', "$.missing")
+# ---------------------------------------------------------------------------
+# NEW generic axis (EXP-111) -- JSON PATH-ARGUMENT POOL
+# ---------------------------------------------------------------------------
+#
+# The second argument to json_tree/json_each is a PATH. This axis sweeps that path over a
+# generic component grammar so the whole path surface is exercised, NOT one crafted literal.
+# It is a database-argument family available to ALL strata (tvf-dense makes it dense, but any
+# program that emits a TVF draws its path from here). Anti-telegraphing: every path is BUILT
+# from generic components (a plain key, a quoted key, a dotted key, a spaced key, an array
+# index, root vs deep) -- there is NO hardcoded `$."a.b"` literal. A quoted-dot path emerges
+# because "dotted key" is one of the generic key kinds crossed with "quote this segment",
+# exactly as a quoted key with spaces or unicode would; the generator sweeps the class.
+#
+# PATH_KEY_KINDS are the per-segment key kinds; a path is 0..N segments deep, each segment
+# either an object key (one of these kinds) or an array index. `render_json_path` assembles a
+# valid SQLite/JSON path string from a drawn segment plan. The coverage probe locks that a
+# floor of DISTINCT paths and every key kind are reached.
+PATH_KEY_KINDS: tuple[str, ...] = (
+    "plain",     # a bare object key:  .items
+    "quoted",    # a quoted object key: ."k"      (quoted but no special chars)
+    "dotted",    # a quoted key CONTAINING a dot:   ."a.b"   (must NOT split into two segments)
+    "spaced",    # a quoted key containing a space: ."space key"
+    "unicode",   # a quoted key containing non-ASCII: ."ключ"
+    "index",     # an array index:  [0]  /  [2]
+    "missing",   # a key that is absent from the doc (exercises the not-found path)
+)
+# Generic key-name components used to BUILD keys of each kind (no target-specific name pinned).
+_PATH_PLAIN_KEYS: tuple[str, ...] = ("a", "b", "c", "items", "meta", "arr", "nested", "tail")
+_PATH_DOT_SEGMENTS: tuple[tuple[str, str], ...] = (("a", "b"), ("x", "y"), ("k", "v"))
+_PATH_SPACE_KEYS: tuple[str, ...] = ("space key", "two words", "a b c")
+_PATH_UNICODE_KEYS: tuple[str, ...] = ("ключ", "café", "☃key")
+_PATH_INDICES: tuple[int, ...] = (0, 1, 2)
+_PATH_MISSING_KEYS: tuple[str, ...] = ("nope", "absent", "zzz")
+
+
+def render_json_path(rng: random.Random) -> str:
+    """Assemble a JSON path argument from the generic segment grammar. Depth 0 yields the root
+    `$`; deeper paths chain object/array segments, each an independently drawn PATH_KEY_KIND.
+    A quoted-dot segment (kind='dotted') produces the `$."a.b"` shape as a GENERATED case, not a
+    pinned literal. Pure function of the passed rng, so the path is seed-stable."""
+    depth = rng.randrange(4)  # 0..3 segments -> root, shallow, and deep paths all reachable
+    parts = ["$"]
+    for _ in range(depth):
+        kind = PATH_KEY_KINDS[rng.randrange(len(PATH_KEY_KINDS))]
+        if kind == "plain":
+            parts.append("." + _PATH_PLAIN_KEYS[rng.randrange(len(_PATH_PLAIN_KEYS))])
+        elif kind == "quoted":
+            parts.append('."' + _PATH_PLAIN_KEYS[rng.randrange(len(_PATH_PLAIN_KEYS))] + '"')
+        elif kind == "dotted":
+            a, b = _PATH_DOT_SEGMENTS[rng.randrange(len(_PATH_DOT_SEGMENTS))]
+            parts.append('."' + a + "." + b + '"')   # a QUOTED dot: one segment, not schema split
+        elif kind == "spaced":
+            parts.append('."' + _PATH_SPACE_KEYS[rng.randrange(len(_PATH_SPACE_KEYS))] + '"')
+        elif kind == "unicode":
+            parts.append('."' + _PATH_UNICODE_KEYS[rng.randrange(len(_PATH_UNICODE_KEYS))] + '"')
+        elif kind == "index":
+            parts.append("[" + str(_PATH_INDICES[rng.randrange(len(_PATH_INDICES))]) + "]")
+        else:  # missing
+            parts.append("." + _PATH_MISSING_KEYS[rng.randrange(len(_PATH_MISSING_KEYS))])
+    return "".join(parts)
+
+
+def path_kinds_in(path: str) -> set[str]:
+    """Classify which PATH_KEY_KINDS a rendered path exercises -- used by the coverage probe to
+    assert the path pool is genuinely swept (every kind reached), without re-deriving the rng."""
+    kinds: set[str] = set()
+    # segment tokens: [n] indices, or ."..." / .plain object keys
+    for m in re.finditer(r'\[\d+\]|\."(?:[^"]*)"|\.[A-Za-z_][A-Za-z0-9_]*', path):
+        seg = m.group(0)
+        if seg.startswith("["):
+            kinds.add("index")
+        elif seg.startswith('."'):
+            inner = seg[2:-1]
+            if "." in inner:
+                kinds.add("dotted")
+            elif " " in inner:
+                kinds.add("spaced")
+            elif any(ord(ch) > 127 for ch in inner):
+                kinds.add("unicode")
+            elif inner in _PATH_MISSING_KEYS:
+                kinds.add("missing")
+            else:
+                kinds.add("quoted")
+        else:
+            key = seg[1:]
+            kinds.add("missing" if key in _PATH_MISSING_KEYS else "plain")
+    return kinds
+
+
+# ---------------------------------------------------------------------------
+# NEW generic axis (EXP-111) -- PLAN-STATE (ANALYZE) INJECTION
+# ---------------------------------------------------------------------------
+#
+# `ANALYZE` populates the sqlite_stat tables and can tip the query planner onto a DIFFERENT
+# plan for the SAME query. Some defects are plan-selection-sensitive (a zero-row aggregate-join
+# path is only reached under a stats-perturbed plan). This axis injects ANALYZE at a swept POINT
+# in the program so BOTH fresh (no-stats) and statistics-perturbed plans are exercised. Generic:
+# a database-state family (run ANALYZE / not) available to ALL strata, driven by a swept enum,
+# no target query pinned. `never` keeps the fresh-plan surface; the others perturb at different
+# times so stats interact with different amounts of data.
+PLAN_STATES: tuple[str, ...] = ("never", "early", "mid", "pre_query")
+
+
+def render_analyze() -> str:
+    return "ANALYZE;"
 
 
 # ---------------------------------------------------------------------------
@@ -794,10 +906,16 @@ def _gen_fts(rng: random.Random) -> list[Op]:
     return ops
 
 
-def _gen_json_tvf(rng: random.Random) -> list[Op]:
+def _gen_json_tvf(rng: random.Random, dense: bool = False) -> list[Op]:
     """JSON table-valued functions (json_each / json_tree) used in a JOIN, correlated
     subquery, or CTE reuse -- the re-entry shapes (WP-023). Reference-comparable: Python
-    sqlite3 ships JSON1 with identical syntax."""
+    sqlite3 ships JSON1 with identical syntax.
+
+    EXP-111: the stored path column and a NEW direct two-arg-path form both draw from the
+    generic JSON PATH-ARGUMENT POOL (render_json_path) so the quoted/dotted/spaced/index path
+    surface is swept -- the WP-023 quoted-two-arg-path shape is one GENERATED inhabitant. When
+    `dense` (tvf-dense stratum), every call emits MULTIPLE re-entry forms AND the direct-path
+    form, so a single program exercises correlated/join/CTE re-entry over swept paths heavily."""
     ops: list[Op] = []
     t = _fresh_name(rng, "jdoc")
     ops.append(Op("DDL", "json_create_table",
@@ -806,69 +924,118 @@ def _gen_json_tvf(rng: random.Random) -> list[Op]:
     tuples = []
     for i in range(n):
         shape = JSON_SHAPES[rng.randrange(len(JSON_SHAPES))]
-        path = JSON_PATHS[rng.randrange(len(JSON_PATHS))]
+        path = render_json_path(rng)   # NEW: swept path-argument pool, not a static literal
         tuples.append(f"({i + 1}, {sql_quote_str(shape)}, {sql_quote_str(path)})")
     ops.append(Op("DML", "json_insert",
                   f"INSERT INTO {t}(id, payload, root_path) VALUES {', '.join(tuples)};"))
-    form = rng.randrange(4)
-    if form == 0:
-        # JOIN over json_tree, per-row root path (resets cursor state across rows).
-        sql = (
-            f"SELECT d.id, jt.fullkey, jt.type FROM {t} AS d "
-            f"JOIN json_tree(d.payload, d.root_path) AS jt "
-            f"WHERE jt.type IN ('object','array','integer','text') "
-            f"ORDER BY d.id, jt.fullkey, jt.type;"
-        )
-        kind = "json_join_tree"
-    elif form == 1:
-        # Correlated scalar subquery re-entering json_tree twice per outer row.
-        sql = (
-            f"SELECT d.id, COALESCE((SELECT jt.fullkey FROM json_tree(d.payload) AS jt "
-            f"WHERE jt.type='text' ORDER BY jt.id LIMIT 1), '<none>') "
-            f"FROM {t} AS d ORDER BY d.id;"
-        )
-        kind = "json_correlated_subquery"
-    elif form == 2:
-        # CTE built on json_tree, referenced twice (UNION ALL) -- cursor-leakage shape.
-        sql = (
-            f"WITH jt AS (SELECT d.id AS did, j.fullkey AS fk, j.type AS ty "
-            f"FROM {t} AS d JOIN json_tree(d.payload) AS j) "
-            f"SELECT 'leaf', did, fk FROM jt WHERE ty NOT IN ('object','array') "
-            f"UNION ALL SELECT 'cont', did, fk FROM jt WHERE ty IN ('object','array') "
-            f"ORDER BY did, fk;"
-        )
-        kind = "json_cte_reuse"
+
+    def _emit_form(form: int) -> None:
+        if form == 0:
+            # JOIN over json_tree, per-row root path (resets cursor state across rows).
+            sql = (
+                f"SELECT d.id, jt.fullkey, jt.type FROM {t} AS d "
+                f"JOIN json_tree(d.payload, d.root_path) AS jt "
+                f"WHERE jt.type IN ('object','array','integer','text') "
+                f"ORDER BY d.id, jt.fullkey, jt.type;"
+            )
+            kind = "json_join_tree"
+        elif form == 1:
+            # Correlated scalar subquery re-entering json_tree twice per outer row.
+            sql = (
+                f"SELECT d.id, COALESCE((SELECT jt.fullkey FROM json_tree(d.payload) AS jt "
+                f"WHERE jt.type='text' ORDER BY jt.id LIMIT 1), '<none>') "
+                f"FROM {t} AS d ORDER BY d.id;"
+            )
+            kind = "json_correlated_subquery"
+        elif form == 2:
+            # CTE built on json_tree, referenced twice (UNION ALL) -- cursor-leakage shape.
+            sql = (
+                f"WITH jt AS (SELECT d.id AS did, j.fullkey AS fk, j.type AS ty "
+                f"FROM {t} AS d JOIN json_tree(d.payload) AS j) "
+                f"SELECT 'leaf', did, fk FROM jt WHERE ty NOT IN ('object','array') "
+                f"UNION ALL SELECT 'cont', did, fk FROM jt WHERE ty IN ('object','array') "
+                f"ORDER BY did, fk;"
+            )
+            kind = "json_cte_reuse"
+        else:
+            # json_each outer feeding a nested json_tree (double TVF re-entry).
+            sql = (
+                f"SELECT d.id, e.key, t.fullkey, t.type FROM {t} AS d "
+                f"JOIN json_each(d.payload, '$.items') AS e "
+                f"JOIN json_tree(e.value) AS t "
+                f"WHERE t.type NOT IN ('object','array') OR t.fullkey='$' "
+                f"ORDER BY d.id, CAST(e.key AS INTEGER), t.id;"
+            )
+            kind = "json_each_then_tree"
+        ops.append(Op("QUERY", kind, sql))
+
+    if dense:
+        # tvf-dense: exercise ALL four re-entry forms in one program.
+        for form in range(4):
+            _emit_form(form)
     else:
-        # json_each outer feeding a nested json_tree (double TVF re-entry).
-        sql = (
-            f"SELECT d.id, e.key, t.fullkey, t.type FROM {t} AS d "
-            f"JOIN json_each(d.payload, '$.items') AS e "
-            f"JOIN json_tree(e.value) AS t "
-            f"WHERE t.type NOT IN ('object','array') OR t.fullkey='$' "
-            f"ORDER BY d.id, CAST(e.key AS INTEGER), t.id;"
-        )
-        kind = "json_each_then_tree"
-    ops.append(Op("QUERY", kind, sql))
+        _emit_form(rng.randrange(4))
+
+    # NEW direct two-arg-path form (all strata): json_tree over a LITERAL doc + a SWEPT LITERAL
+    # path, projecting the `path`/`fullkey` columns. This is the WP-023 surface -- a quoted/dotted
+    # two-arg path whose per-row `path` column must match sqlite. The doc is drawn to carry the
+    # kind of keys the path may reference; the path is a generated pool member (no pinned literal).
+    doc = JSON_SHAPES[rng.randrange(len(JSON_SHAPES))]
+    lit_path = render_json_path(rng)
+    ops.append(Op(
+        "QUERY", "json_two_arg_path",
+        f"SELECT key, type, fullkey, path FROM json_tree({sql_quote_str(doc)}, "
+        f"{sql_quote_str(lit_path)}) ORDER BY fullkey, path, key, type;",
+    ))
     return ops
 
 
-def _gen_trigger(rng: random.Random) -> list[Op]:
+def _gen_trigger(rng: random.Random, dense: bool = False) -> list[Op]:
     """A trigger created with the shared identifier-style pool, then a reopen boundary,
     then a DML that FIRES it -- the create/reopen/use sequence (WP-005 shape). Fully
-    reference-comparable (both engines have triggers with this syntax)."""
+    reference-comparable (both engines have triggers with this syntax).
+
+    EXP-111: between the trigger CREATE and the reopen/fire, an UNRELATED schema mutation
+    (ALTER TABLE <other> DROP COLUMN / ADD COLUMN, or a DROP of an unrelated object) runs, so
+    the schema is reloaded with the trigger's referenced (possibly quoted) table name having to
+    re-resolve across a schema change -- the WP-005 reload precondition (a quoted trigger-target
+    name that must NOT be mis-parsed after an unrelated DDL). Generic: an unrelated schema-change
+    axis, no target name pinned. `dense` (trigger-dense stratum) fires the trigger MORE and adds
+    a re-CREATE/re-fire cycle so trigger lifecycle churn is heavy in every program."""
     ops: list[Op] = []
     style = IDENTIFIER_STYLES[rng.randrange(len(IDENTIFIER_STYLES))]
+    # In trigger-dense, force a DELIMITED (quoted) style on the target/trigger names so the
+    # quoted-reload contract is exercised in every dense program; otherwise sweep the full pool.
+    if dense:
+        style = ("quoted", "spaced", "dotted", "bracketed", "backticked")[
+            rng.randrange(5)]
     base = _fresh_name(rng, "trg")
     tgt = render_identifier(f"{base}_t", style)
     audit = render_identifier(f"{base}_a", style)
     trg = render_identifier(f"{base}_g", style)
+    # An UNRELATED table that the intervening schema mutation touches (not the trigger target).
+    other = render_identifier(f"{base}_o", IDENTIFIER_STYLES[rng.randrange(len(IDENTIFIER_STYLES))])
     ops.append(Op("DDL", "trigger_target_table",
                   f"CREATE TABLE {tgt}(id INTEGER PRIMARY KEY, a TEXT, b TEXT);"))
     ops.append(Op("DDL", "trigger_audit_table",
                   f"CREATE TABLE {audit}(msg TEXT);"))
+    ops.append(Op("DDL", "trigger_unrelated_table",
+                  f"CREATE TABLE {other}(id INTEGER PRIMARY KEY, x TEXT, z TEXT);"))
     ops.append(Op("DDL", "trigger_create",
                   f"CREATE TRIGGER {trg} AFTER INSERT ON {tgt} BEGIN "
                   f"INSERT INTO {audit} VALUES('fired:' || NEW.a || ':' || NEW.b); END;"))
+    # UNRELATED schema mutation between CREATE and reopen/fire -- forces a schema reload where the
+    # trigger's (quoted) target name must re-resolve (the WP-005 precondition). Swept kind.
+    mut = ("drop_col", "add_col", "drop_unrelated")[rng.randrange(3)]
+    if mut == "drop_col":
+        ops.append(Op("DDL", "trigger_schema_mutate",
+                      f"ALTER TABLE {other} DROP COLUMN z;"))
+    elif mut == "add_col":
+        ops.append(Op("DDL", "trigger_schema_mutate",
+                      f"ALTER TABLE {other} ADD COLUMN w TEXT;"))
+    else:
+        ops.append(Op("DDL", "trigger_schema_mutate",
+                      f"DROP TABLE {other};"))
     # Reopen so the trigger is exercised after a schema reload (the WP-005 precondition).
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     # EXP-106 lever 2 -- SWEEP the fired values from the boundary pool, and fire the trigger
@@ -879,7 +1046,7 @@ def _gen_trigger(rng: random.Random) -> list[Op]:
     # feed || string concatenation, where a raw blob would render differently per transport --
     # a transport artifact, not a product divergence); the whole boundary pool would reintroduce
     # the render-noise EXP-105 closed. Generic: a swept pool of literals, no target tuple.
-    n_fires = rng.randint(1, 3)
+    n_fires = rng.randint(3, 5) if dense else rng.randint(1, 3)
     for f in range(n_fires):
         a_val = render_literal(_text_boundary(rng))
         b_val = render_literal(_text_boundary(rng))
@@ -891,14 +1058,36 @@ def _gen_trigger(rng: random.Random) -> list[Op]:
                  f"SELECT msg FROM {audit} ORDER BY msg;"))
     ops.append(Op("QUERY", "trigger_target_read",
                  f"SELECT id, a, b FROM {tgt} ORDER BY id;"))
+    if dense:
+        # trigger-dense: DROP + re-CREATE the trigger, reopen, and re-fire so trigger lifecycle
+        # (create/fire/reopen/re-create/re-fire) is heavily exercised over the reload boundary.
+        ops.append(Op("DDL", "trigger_drop", f"DROP TRIGGER {trg};"))
+        ops.append(Op("DDL", "trigger_recreate",
+                      f"CREATE TRIGGER {trg} AFTER INSERT ON {tgt} BEGIN "
+                      f"INSERT INTO {audit} VALUES('refired:' || NEW.a); END;"))
+        ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
+        rn = rng.randint(1, 2)
+        for f in range(rn):
+            av = render_literal(_text_boundary(rng))
+            ops.append(Op("DML", "trigger_fire",
+                         f"INSERT INTO {tgt}(id, a, b) VALUES ({100 + f}, {av}, 'r');"))
+        ops.append(Op("QUERY", "trigger_audit_read",
+                     f"SELECT msg FROM {audit} ORDER BY msg;"))
     return ops
 
 
-def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
+def _gen_attach(rng: random.Random, run_ctx: dict, dense: bool = False) -> list[Op]:
     """ATTACH an auxiliary db, do DDL/DROP inside it, checkpoint, reopen, then read back
     -- the attached-db page-lifecycle sequence (WP-008 shape). Reference-comparable
     (ATTACH is standard SQL). The aux path is resolved by the runner at exec time via a
-    placeholder, since the reference and candidate use different run dirs."""
+    placeholder, since the reference and candidate use different run dirs.
+
+    EXP-111: the sequence adds the WP-008 preconditions generically -- a same-named table in
+    BOTH main and aux, an INDEX on the aux table, PAGE-CHURN inserts (enough rows to span
+    multiple pages), then DROP the indexed aux table and run a SCHEMA-QUALIFIED
+    `PRAGMA aux.integrity_check` (the attached-db page free/reclaim corruption surface). `dense`
+    (attach-dense stratum) makes every program run this FULL lifecycle with MORE aux tables and
+    heavier churn. Generic: standard SQL, no target names pinned (fresh names each time)."""
     ops: list[Op] = []
     alias = _fresh_name(rng, "aux")
     # AUX_DB placeholder is substituted by each runner with its own aux file path, so the
@@ -908,23 +1097,40 @@ def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
     # EXP-106 lever 4 -- ATTACH LIFECYCLE COMPLETENESS. Create TWO aux tables so the full
     # page-lifecycle sequence (aux-DDL + DROP + checkpoint + reopen + read-back) ALWAYS runs
     # in one program: one table is DROPped (exercising the attached-db page free/reclaim path,
-    # the WP-008 precondition) while the SURVIVOR is read back after the reopen (so there is
-    # always a post-reopen read-back, which the old coin-flip suppressed whenever it dropped
-    # the only table). Aux inserts sweep text-boundary values instead of the constant (1,'x')
-    # so persisted aux values vary. Generic: standard SQL, no target constant.
+    # the WP-008 precondition) while the SURVIVOR is read back after the reopen. Aux inserts
+    # sweep text-boundary values so persisted aux values vary. Generic: standard SQL.
     at_drop = _fresh_name(rng, "at")
     at_keep = _fresh_name(rng, "at")
     ops.append(Op("DDL", "attach_create",
-                  f"CREATE TABLE {alias}.{at_drop}(id INTEGER PRIMARY KEY, v TEXT);"))
+                  f"CREATE TABLE {alias}.{at_drop}(id INTEGER PRIMARY KEY, x TEXT, v TEXT);"))
     ops.append(Op("DDL", "attach_create2",
                   f"CREATE TABLE {alias}.{at_keep}(id INTEGER PRIMARY KEY, v TEXT);"))
+    # WP-008 precondition 1: a table of the SAME NAME in main and aux (name-collision across the
+    # attach boundary is part of the reported page-lifecycle corruption shape). Generic: the
+    # collision is with the aux drop-target's base name; no target-specific name pinned.
+    same_base = at_drop
+    ops.append(Op("DDL", "attach_main_samename",
+                  f"CREATE TABLE {same_base}(id INTEGER PRIMARY KEY, x TEXT, v TEXT);"))
+    # WP-008 precondition 2: an INDEX on the aux drop-target (schema-qualified INDEX name, bare
+    # table -- the syntax both Python-sqlite3 reference and tursodb accept), and one on the main
+    # same-named table, so the DROP must reclaim indexed pages.
+    ops.append(Op("DDL", "attach_index_aux",
+                  f"CREATE INDEX {alias}.idx_{at_drop}_x ON {at_drop}(x);"))
+    ops.append(Op("DDL", "attach_index_main",
+                  f"CREATE INDEX idx_main_{same_base}_x ON {same_base}(x);"))
     dv = render_literal(_text_boundary(rng))
     kv = render_literal(_text_boundary(rng))
-    ops.append(Op("DML", "attach_insert",
-                  f"INSERT INTO {alias}.{at_drop}(id, v) VALUES (1, {dv}), (2, {kv});"))
     ops.append(Op("DML", "attach_insert2",
                   f"INSERT INTO {alias}.{at_keep}(id, v) VALUES (1, {kv}), (2, {dv});"))
-    # Always DROP one table (the page-lifecycle trigger) and always keep the other to read back.
+    # WP-008 precondition 3: PAGE CHURN -- insert enough rows into the indexed aux table to span
+    # multiple pages, so DROP TABLE has real page-free work (the corruption manifests on reclaim).
+    n_churn = rng.randint(120, 260) if dense else rng.randint(60, 140)
+    churn_rows = ", ".join(f"({i}, 'pad{i}', 'v{i}')" for i in range(1, n_churn + 1))
+    ops.append(Op("DML", "attach_insert",
+                  f"INSERT INTO {alias}.{at_drop}(id, x, v) VALUES {churn_rows};"))
+    ops.append(Op("DML", "attach_insert_main",
+                  f"INSERT INTO {same_base}(id, x, v) VALUES {churn_rows};"))
+    # DROP the indexed, page-spanning aux table (the page free/reclaim trigger -- WP-008).
     ops.append(Op("DDL", "attach_drop", f"DROP TABLE {alias}.{at_drop};"))
     ops.append(Op("LIFECYCLE", "attach_checkpoint", "PRAGMA wal_checkpoint(TRUNCATE);", ref_comparable=False))
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
@@ -933,6 +1139,11 @@ def _gen_attach(rng: random.Random, run_ctx: dict) -> list[Op]:
     # Persisted-value read-back of the SURVIVING aux table (projects the swept values).
     ops.append(Op("QUERY", "attach_read",
                  f"SELECT id, v FROM {alias}.{at_keep} ORDER BY id;"))
+    # SCHEMA-QUALIFIED aux integrity check -- the WP-008 oracle (tursodb reports a page ShortRead
+    # / corruption after the indexed-aux DROP; the reference reports ok). Kind attach_integrity so
+    # the integrity oracle captures it; an accept-mismatch (tursodb rc!=0) reds via error_class.
+    ops.append(Op("LIFECYCLE", "attach_integrity", f"PRAGMA {alias}.integrity_check;"))
+    # Also the whole-db integrity check.
     ops.append(Op("LIFECYCLE", "attach_integrity", "PRAGMA integrity_check;"))
     ops.append(Op("LIFECYCLE", "attach", f"DETACH {alias};"))
     return ops
@@ -988,6 +1199,32 @@ def _render_scalar_persist(fn: str, val: str) -> str:
 ZEROBLOB_SIZES: tuple[int, ...] = (0, 1, 4096)
 
 
+# EXP-111 -- NUMERIC-PREFIX STRING PATTERN. A generic family of strings that BEGIN with a numeric
+# token then carry a non-numeric suffix (e.g. an integer/real prefix + letters/space/punctuation).
+# Feeding one of these to a size-expecting function like zeroblob() exercises the string->integer
+# COERCION boundary (SQLite truncates at the numeric prefix; a divergent engine coerces to 0 or
+# differently) -- the WP-015 surface. This is a PATTERN built from generic components, NOT a
+# pinned literal: the numeric prefix, the suffix, and their join are all drawn/assembled here, so
+# the anti-telegraphing rule holds (no hardcoded '3.9suffix'-style constant special-cased).
+_NUMPREFIX_HEADS: tuple[str, ...] = ("0", "1", "2", "3", "7", "12", "42", "100", "3.9", "1.5", "0.5", "10e2")
+_NUMPREFIX_TAILS: tuple[str, ...] = ("abc", "suffix", "px", " x", "-tail", "_k", "e!", " and more", "XYZ")
+
+
+def _numeric_prefix_string(rng: random.Random) -> str:
+    """Assemble a numeric-prefix string from a generic numeric head + a non-numeric tail. Pure
+    function of the passed rng. Sometimes leading/trailing whitespace is added (another coercion
+    edge). No pinned literal -- the pieces and their join are all swept."""
+    head = _NUMPREFIX_HEADS[rng.randrange(len(_NUMPREFIX_HEADS))]
+    tail = _NUMPREFIX_TAILS[rng.randrange(len(_NUMPREFIX_TAILS))]
+    s = head + tail
+    lead = rng.randrange(3)
+    if lead == 1:
+        s = "  " + s
+    elif lead == 2:
+        s = s + "  "
+    return s
+
+
 # Scalar functions whose result is a genuine BLOB or TEXT -- safe to read back via quote()
 # without hitting the quote(REAL) digit-count divergence. Only these feed the r_blobtext column,
 # and ONLY over text-only inputs (_text_boundary), so `quote`/`hex` render a deterministic,
@@ -997,7 +1234,7 @@ ZEROBLOB_SIZES: tuple[int, ...] = (0, 1, 4096)
 BLOBTEXT_SCALAR_FUNCS: tuple[str, ...] = ("hex", "quote", "cast_text", "upper", "lower", "trim")
 
 
-def _gen_scalar_persist(rng: random.Random) -> list[Op]:
+def _gen_scalar_persist(rng: random.Random, dense: bool = False) -> list[Op]:
     """EXP-109 lever 3 -- SCALAR-FUNCTION BOUNDARY PERSISTED READ-BACK. Build a table, INSERT
     rows whose columns are scalar-function calls over swept boundary values (incl. numeric-
     prefix strings, overflow ints, zeroblob sizes 0/1/4096), then REOPEN and read the stored
@@ -1019,7 +1256,7 @@ def _gen_scalar_persist(rng: random.Random) -> list[Op]:
     t = _fresh_name(rng, "scal")
     ops.append(Op("DDL", "scalar_create_table",
                   f"CREATE TABLE {t}(id INTEGER PRIMARY KEY, fn TEXT, r_any, r_blobtext);"))
-    n = rng.randint(3, 6)
+    n = rng.randint(5, 9) if dense else rng.randint(3, 6)
     rows = []
     for i in range(n):
         # r_any: a NUMERIC-result scalar over the FULL boundary pool (overflow/numeric-prefix/
@@ -1045,6 +1282,18 @@ def _gen_scalar_persist(rng: random.Random) -> list[Op]:
     ops.append(Op("DML", "scalar_insert_zeroblob",
                   f"INSERT INTO {t}(id, fn, r_any, r_blobtext) VALUES "
                   f"({n + 1}, 'zeroblob_lit', length(zeroblob({zsize})), zeroblob({zsize}));"))
+    # WP-015 surface: zeroblob over a NUMERIC-PREFIX STRING (string->integer size coercion). The
+    # reference coerces the leading numeric token (SQLite truncates at the first non-numeric
+    # char); a divergent engine coerces differently (empty blob). Both sides are transport-safe:
+    # length() is an INT (bare), and the zeroblob itself is a genuine BLOB read back via quote().
+    # The argument is a GENERATED numeric-prefix string (pattern), not a pinned literal.
+    n_np = rng.randint(2, 4) if dense else 1
+    for k in range(n_np):
+        nps = _numeric_prefix_string(rng)
+        lit = sql_quote_str(nps)
+        ops.append(Op("DML", "scalar_insert_zeroblob_numprefix",
+                      f"INSERT INTO {t}(id, fn, r_any, r_blobtext) VALUES "
+                      f"({n + 2 + k}, 'zeroblob_numprefix', length(zeroblob({lit})), zeroblob({lit}));"))
     # Reopen forces the stored values through the on-disk persistence path (the reload boundary).
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     # Read the PERSISTED values back: r_any bare (+ typeof/length so a type- or value-level
@@ -1052,6 +1301,87 @@ def _gen_scalar_persist(rng: random.Random) -> list[Op]:
     ops.append(Op("QUERY", "scalar_readback",
                  f"SELECT id, fn, typeof(r_any), length(r_any), r_any, quote(r_blobtext) "
                  f"FROM {t} ORDER BY id;"))
+    return ops
+
+
+def _gen_agg_join(rng: random.Random, dense: bool = False) -> list[Op]:
+    """AGGREGATE-OVER-JOIN across populated / empty / all-NULL tables, with the PLAN-STATE
+    (ANALYZE) axis (EXP-111). Builds a left/right pair with composite (bucket,id) indexes and a
+    population mode per table (populated / empty / all_null), runs ANALYZE at a swept POINT
+    (never / early / mid / pre_query) so both fresh and stats-perturbed plans are exercised, then
+    an ungrouped aggregate over the join whose INNER selection is EMPTY (WHERE left.id < 0) -- the
+    single null-row group (COUNT=0, other cols NULL). A divergent engine panics on the null-row
+    cursor path (WP-002). All generic: population axis + plan-state axis, no target tuple pinned.
+    `dense` (agg-join-dense stratum) makes every program run the full populated/empty/all-NULL
+    matrix with multiple aggregate shapes and ANALYZE perturbation."""
+    ops: list[Op] = []
+    base = _fresh_name(rng, "aj")
+    lft = f"{base}_l"
+    rgt = f"{base}_r"
+    # Population mode per side -- an empty or all-NULL inner is what makes the degenerate group.
+    pop_l = _weighted_choice(rng, POPULATION_MODES)
+    pop_r = _weighted_choice(rng, POPULATION_MODES)
+    plan_state = PLAN_STATES[rng.randrange(len(PLAN_STATES))]
+    ops.append(Op("DDL", "agg_join_create_l",
+                  f"CREATE TABLE {lft}(id INTEGER PRIMARY KEY, bucket INT, label TEXT);"))
+    ops.append(Op("DDL", "agg_join_create_r",
+                  f"CREATE TABLE {rgt}(id INTEGER PRIMARY KEY, bucket INT, label TEXT, metric REAL);"))
+    ops.append(Op("DDL", "agg_join_index_l",
+                  f"CREATE INDEX idx_{lft}_bk ON {lft}(bucket, id);"))
+    ops.append(Op("DDL", "agg_join_index_r",
+                  f"CREATE INDEX idx_{rgt}_bk ON {rgt}(bucket, id);"))
+
+    def _fill(tbl: str, pop: str, with_metric: bool) -> None:
+        if pop == "empty":
+            return
+        nrows = rng.randint(24, 96)
+        tuples = []
+        for i in range(nrows):
+            if pop == "all_null":
+                tuples.append(f"({i}, NULL, NULL" + (", NULL)" if with_metric else ")"))
+            else:
+                bk = i % 12
+                if with_metric:
+                    tuples.append(f"({i}, {bk}, 'R{i}', {i * 1.5})")
+                else:
+                    tuples.append(f"({i}, {bk}, 'L{i}')")
+        cols = "(id, bucket, label, metric)" if with_metric else "(id, bucket, label)"
+        ops.append(Op("DML", "agg_join_fill",
+                      f"INSERT INTO {tbl}{cols} VALUES {', '.join(tuples)};"))
+
+    _fill(lft, pop_l, with_metric=False)
+    _fill(rgt, pop_r, with_metric=True)
+
+    # PLAN-STATE axis: run ANALYZE at the swept point. `early` analyzes right after the initial
+    # fill; `mid` perturbs the distribution with an extra insert then analyzes; `pre_query`
+    # analyzes immediately before the aggregate; `never` leaves the fresh (no-stats) plan.
+    if plan_state == "early":
+        ops.append(Op("LIFECYCLE", "analyze", render_analyze(), ref_comparable=False))
+    if plan_state == "mid":
+        # a small extra insert then ANALYZE, so stats see a perturbed distribution
+        if pop_l != "empty":
+            ops.append(Op("DML", "agg_join_fill",
+                          f"INSERT INTO {lft}(id, bucket, label) VALUES (1000, 0, 'x'), (1001, 1, 'y');"))
+        ops.append(Op("LIFECYCLE", "analyze", render_analyze(), ref_comparable=False))
+    if plan_state == "pre_query":
+        ops.append(Op("LIFECYCLE", "analyze", render_analyze(), ref_comparable=False))
+
+    # Empty-inner aggregate-over-join: WHERE left.id < 0 selects zero left rows, so the join is
+    # empty and the ungrouped aggregate returns a single null-row group.
+    join = ("JOIN", "LEFT JOIN")[rng.randrange(2)]
+    ops.append(Op("QUERY", "agg_join_empty_inner",
+                  f"SELECT COUNT(*), {lft}.label, {rgt}.label, SUM({rgt}.metric) "
+                  f"FROM {lft} {join} {rgt} ON {lft}.bucket = {rgt}.bucket "
+                  f"WHERE {lft}.id < 0;"))
+    if dense:
+        # Additional aggregate shapes over the same (possibly empty/all-NULL) join.
+        ops.append(Op("QUERY", "agg_join_grouped",
+                      f"SELECT {lft}.bucket, COUNT(*), AVG({rgt}.metric), MAX({rgt}.label) "
+                      f"FROM {lft} {join} {rgt} ON {lft}.bucket = {rgt}.bucket "
+                      f"WHERE {lft}.id < 0 GROUP BY {lft}.bucket ORDER BY {lft}.bucket;"))
+        ops.append(Op("QUERY", "agg_join_total",
+                      f"SELECT TOTAL({rgt}.metric), MIN({rgt}.metric) "
+                      f"FROM {lft} {join} {rgt} ON {lft}.bucket = {rgt}.bucket WHERE {rgt}.id < 0;"))
     return ops
 
 
@@ -1080,22 +1410,100 @@ def _gen_feature(rng: random.Random, families: tuple[str, ...], run_ctx: dict) -
         return _gen_attach(rng, run_ctx)
     if chosen.name == "scalar_persist":
         return _gen_scalar_persist(rng)
+    if chosen.name == "agg_join":
+        return _gen_agg_join(rng)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# STRATUM axis (EXP-111) -- stratified family-dense sweeps
+# ---------------------------------------------------------------------------
+#
+# The five outstanding differential matchers (WP-002/005/008/015/023) each need a DIFFERENT
+# feature family's full precondition chain to be present in the SAME program. In a mixed-grammar
+# sweep, any one family's chain appears only intermittently, so the JOINT probability that ALL of
+# one family's preconditions co-occur is diluted -- the misses were a search-strategy problem, not
+# a coverage problem (EXP-110 proved all 5 defects PRESENT at the pin). A STRATUM makes ONE family
+# DENSE in every program of a batch while EVERY OTHER axis (config, quoting, population, plan-state,
+# path-pool, quarantines, allowlists, durability tail) keeps sweeping normally. So a stratum sweep
+# concentrates search pressure on one family's precondition chain without narrowing anything else.
+#
+# The stratum is seed-derived by default (so a plain seeded sweep still stratifies deterministically
+# and covers all strata across a batch), OR pinned by the GENFUZZ_STRATUM env/workload-arg (so a
+# per-stratum sweep can drive one family dense). Strata are GENERIC family-level names -- NO bug
+# constants. The dense family is guaranteed present AND generated in `dense=True` mode (its full
+# lifecycle every program); all other families still appear at their normal mask rate.
+STRATA: tuple[str, ...] = (
+    "trigger-dense",         # trigger lifecycle heavy + quoting at full strength (WP-005 inhabits)
+    "attach-dense",          # full attach page-lifecycle every program (WP-008 inhabits)
+    "scalar-persist-dense",  # scalar-boundary persist over the pool every program (WP-015 inhabits)
+    "tvf-dense",             # json_each/json_tree re-entry + path-pool every program (WP-023 inhabits)
+    "agg-join-dense",        # aggregate-over-join + plan-state every program (WP-002 inhabits)
+    "mixed",                 # no forced density -- the pre-EXP-111 behaviour, kept for the null sweep
+)
+# Which feature family each stratum makes dense (generic mapping; the stratum name is the axis).
+_STRATUM_DENSE_FAMILY: dict[str, str] = {
+    "trigger-dense": "trigger",
+    "attach-dense": "attach",
+    "scalar-persist-dense": "scalar_persist",
+    "tvf-dense": "json_tvf",
+    "agg-join-dense": "agg_join",
+}
+
+
+def choose_stratum(root: int, override: Optional[str] = None) -> str:
+    """Pick this program's stratum. `override` (from GENFUZZ_STRATUM / a workload arg) pins it;
+    otherwise a seed-derived draw over STRATA (excluding 'mixed' so a seeded sweep concentrates
+    on a real family, cycling through all five across a batch). Pure function of (root, override)."""
+    if override:
+        if override in STRATA:
+            return override
+        return "mixed"
+    # Seed-derived: draw from the five DENSE strata so a plain seeded sweep stratifies across all
+    # of them deterministically (mixed is only reached via an explicit override for the null sweep).
+    dense_strata = tuple(s for s in STRATA if s != "mixed")
+    rng = seeded_rng(root, "stratum")
+    return dense_strata[rng.randrange(len(dense_strata))]
+
+
+def _gen_dense_family(rng: random.Random, family: str, run_ctx: dict) -> list[Op]:
+    """Emit ONE dense-mode op sequence for the stratum's family (its full precondition lifecycle)."""
+    if family == "trigger":
+        return _gen_trigger(rng, dense=True)
+    if family == "attach":
+        return _gen_attach(rng, run_ctx, dense=True)
+    if family == "scalar_persist":
+        return _gen_scalar_persist(rng, dense=True)
+    if family == "json_tvf":
+        return _gen_json_tvf(rng, dense=True)
+    if family == "agg_join":
+        return _gen_agg_join(rng, dense=True)
     return []
 
 
 def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] = (),
              feature_families: tuple[str, ...] = FEATURE_FAMILY_NAMES,
-             emit_suppress: bool = False) -> Program:
+             emit_suppress: bool = False, stratum: Optional[str] = None) -> Program:
     """Produce a Program fully determined by seed. axes is CORE_AXES merged with any
     product axes. lifecycle_plug adds product lifecycle op kinds (e.g. checkpoint).
-    emit_suppress prints the config-quarantine SUPPRESSED lines (on during a real sweep)."""
+    emit_suppress prints the config-quarantine SUPPRESSED lines (on during a real sweep).
+
+    EXP-111 stratum: `stratum` pins the family-density stratum (else GENFUZZ_STRATUM env, else a
+    seed-derived draw over the five dense strata). The stratum's family is forced DENSE (full
+    lifecycle) in EVERY program of the batch, while every other axis keeps sweeping normally."""
     root = seed  # seed is already a root int
+    stratum_choice = choose_stratum(root, stratum or os.environ.get("GENFUZZ_STRATUM"))
+    dense_family = _STRATUM_DENSE_FAMILY.get(stratum_choice)
     config = choose_config(root, axes, emit_suppress=emit_suppress)
     # EXP-109 lever 1c -- restrict this program's feature families to the seed-derived inclusion
     # mask, so a real fraction of programs are FTS-free (unmasking non-FTS integrity failures).
     # The mask is a pure function of the seed; the coverage guarantee below only forces in
     # families that survived the mask, never a masked-out one.
     active_families = feature_mask(root, feature_families)
+    # The stratum's dense family is ALWAYS active (never masked out) -- the whole point is that it
+    # runs its full lifecycle in every program. Other families keep their normal mask inclusion.
+    if dense_family and dense_family in feature_families and dense_family not in active_families:
+        active_families = active_families + (dense_family,)
     rng = seeded_rng(root, "ops")
     tables: list[dict] = []
     ops: list[Op] = []
@@ -1121,16 +1529,28 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
     # Interleave DML / QUERY / LIFECYCLE / EXPECT_ERROR / FEATURE. Fixed count for stable
     # coverage. Feature ops (fts/json/trigger/attach) are drawn from the same interleave so
     # they compose with the base surface rather than living in a separate phase.
+    # STRATUM DENSITY: emit the dense family's full lifecycle up-front so EVERY program in the
+    # stratum exercises that family's precondition chain. One dense emission here plus the
+    # feature-force-in below (which also emits dense for the stratum family) guarantees density.
+    if dense_family:
+        ops.extend(_gen_dense_family(rng, dense_family, run_ctx))
+
     n_body = rng.randint(8, 14)
     for _ in range(n_body):
         pick = rng.random()
-        if pick < 0.30:
+        if pick < 0.28:
             ops.extend(_gen_dml(rng, tables))
-        elif pick < 0.55:
+        elif pick < 0.50:
             ops.extend(_gen_query(rng, tables))
-        elif pick < 0.70:
-            ops.extend(_gen_feature(rng, active_families, run_ctx))
-        elif pick < 0.85:
+        elif pick < 0.68:
+            # Feature op. In a stratum, bias the draw toward the dense family so it is exercised
+            # repeatedly (density), while still letting OTHER masked-in families appear (the other
+            # axes keep sweeping). Non-dense families keep their normal non-dense generation.
+            if dense_family and rng.random() < 0.6:
+                ops.extend(_gen_dense_family(rng, dense_family, run_ctx))
+            else:
+                ops.extend(_gen_feature(rng, active_families, run_ctx))
+        elif pick < 0.84:
             ops.extend(_gen_lifecycle(rng, lifecycle_plug))
         else:
             ops.extend(_gen_expect_error(rng, tables))
@@ -1151,22 +1571,27 @@ def generate(seed: int, axes: dict[str, tuple], lifecycle_plug: tuple[str, ...] 
         "trigger": "trigger_create",
         "attach": "attach_create",
         "scalar_persist": "scalar_create_table",
+        "agg_join": "agg_join_create_l",
     }
     # Force in ONLY families that survived this program's inclusion mask (active_families) --
     # a masked-out family (e.g. FTS in an FTS-free program) is deliberately absent and must NOT
-    # be forced back in, or the mask would be a no-op and the integrity tail never unmask.
+    # be forced back in, or the mask would be a no-op and the integrity tail never unmask. The
+    # stratum's dense family is emitted in DENSE mode so its full precondition chain is present.
     for fam in active_families:
         if fam in _FEATURE_BY_NAME and _feature_marker.get(fam) not in present_kinds:
+            is_dense = (fam == dense_family)
             if fam == "fts":
                 ops.extend(_gen_fts(rng))
             elif fam == "json_tvf":
-                ops.extend(_gen_json_tvf(rng))
+                ops.extend(_gen_json_tvf(rng, dense=is_dense))
             elif fam == "trigger":
-                ops.extend(_gen_trigger(rng))
+                ops.extend(_gen_trigger(rng, dense=is_dense))
             elif fam == "attach":
-                ops.extend(_gen_attach(rng, run_ctx))
+                ops.extend(_gen_attach(rng, run_ctx, dense=is_dense))
             elif fam == "scalar_persist":
-                ops.extend(_gen_scalar_persist(rng))
+                ops.extend(_gen_scalar_persist(rng, dense=is_dense))
+            elif fam == "agg_join":
+                ops.extend(_gen_agg_join(rng, dense=is_dense))
             present_kinds = {op.kind for op in ops}
 
     # EXP-106 lever 3 -- GENERIC DURABILITY READ-BACK TAIL. Every program ends with a reopen
@@ -2064,14 +2489,17 @@ def run_case(
     lifecycle_plug: tuple[str, ...] = (),
     case_id: str = "GEN",
     emit: bool = True,
+    stratum: Optional[str] = None,
 ) -> CaseResult:
     """Generate a program from seed, run reference + candidate, apply every universal
     oracle, and emit the INVARIANT/VERDICT protocol. runners = (reference, candidate).
 
     Verdict: RED if any oracle fails; VOID if the harness itself errored; else GREEN.
-    """
+
+    EXP-111: `stratum` forwards to generate() to pin the family-density stratum (else the
+    seed-derived draw / GENFUZZ_STRATUM env is used)."""
     reference, candidate = runners
-    program = generate(seed, axes, lifecycle_plug, emit_suppress=emit)
+    program = generate(seed, axes, lifecycle_plug, emit_suppress=emit, stratum=stratum)
     findings: list[Finding] = []
     verdict = "GREEN"
     exit_code = 0
