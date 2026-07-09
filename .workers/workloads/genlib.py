@@ -1024,14 +1024,14 @@ def _gen_trigger(rng: random.Random, dense: bool = False) -> list[Op]:
     ops.append(Op("DDL", "trigger_create",
                   f"CREATE TRIGGER {trg} AFTER INSERT ON {tgt} BEGIN "
                   f"INSERT INTO {audit} VALUES('fired:' || NEW.a || ':' || NEW.b); END;"))
-    # UNRELATED schema mutation between CREATE and reopen/fire -- forces a schema reload where the
+    # UNRELATED schema mutation between CREATE and fire -- forces a schema reload where the
     # trigger's (quoted) target name must re-resolve (the WP-005 precondition). Swept over ONLY
     # tursodb-supported DDL so the mutation ACCEPTS on both engines (an unsupported DDL would
-    # accept-mismatch and truncate the program before the re-fire, masking WP-005 -- EXP-111 smoke
-    # found ALTER DROP COLUMN is unsupported by the pin, a near-miss recorded separately). ADD
-    # COLUMN, an unrelated CREATE INDEX, a RENAME, and dropping the unrelated table all reload the
-    # schema and are accepted. Generic: an unrelated schema-change axis, no target name pinned.
-    mut = ("add_col", "add_index", "rename_col", "drop_unrelated")[rng.randrange(4)]
+    # accept-mismatch and truncate the program before the fire, masking WP-005 -- EXP-111 smoke
+    # found ALTER DROP COLUMN and ALTER RENAME COLUMN are unsupported by the pin, near-misses
+    # recorded separately). ADD COLUMN, an unrelated CREATE INDEX, and dropping the unrelated
+    # table all reload the schema and are accepted. Generic: an unrelated schema-change axis.
+    mut = ("add_col", "add_index", "drop_unrelated")[rng.randrange(3)]
     if mut == "add_col":
         ops.append(Op("DDL", "trigger_schema_mutate",
                       f"ALTER TABLE {other} ADD COLUMN w TEXT;"))
@@ -1039,13 +1039,20 @@ def _gen_trigger(rng: random.Random, dense: bool = False) -> list[Op]:
         oidx = render_identifier(f"{base}_oi", style)
         ops.append(Op("DDL", "trigger_schema_mutate",
                       f"CREATE INDEX {oidx} ON {other}(x);"))
-    elif mut == "rename_col":
-        ops.append(Op("DDL", "trigger_schema_mutate",
-                      f"ALTER TABLE {other} RENAME COLUMN z TO z2;"))
     else:
         ops.append(Op("DDL", "trigger_schema_mutate",
                       f"DROP TABLE {other};"))
-    # Reopen so the trigger is exercised after a schema reload (the WP-005 precondition).
+    # SAME-CONNECTION fire: fire the trigger IMMEDIATELY after the unrelated schema change, with NO
+    # intervening reopen, so the trigger's quoted target must re-resolve against a schema cache that
+    # was just mutated in-connection (the WP-005 stale-schema path -- the corpus repro fires without
+    # a reopen). Then ALSO reopen and fire again (the cross-reopen reload path). Both are swept.
+    same_conn_a = render_literal(_text_boundary(rng))
+    same_conn_b = render_literal(_text_boundary(rng))
+    ops.append(Op("DML", "trigger_fire_sameconn",
+                  f"INSERT INTO {tgt}(id, a, b) VALUES (900, {same_conn_a}, {same_conn_b});"))
+    ops.append(Op("QUERY", "trigger_audit_read",
+                  f"SELECT msg FROM {audit} ORDER BY msg;"))
+    # Reopen so the trigger is also exercised after a full schema reload (the WP-005 precondition).
     ops.append(Op("LIFECYCLE", "reopen", "-- reopen --"))
     # EXP-106 lever 2 -- SWEEP the fired values from the boundary pool, and fire the trigger
     # MORE THAN ONCE, so the trigger side-effect (concatenation of boundary values through
